@@ -3,6 +3,13 @@ import win32ui
 from ctypes import windll
 from PIL import Image
 
+
+user32 = windll.user32
+screen_width = user32.GetSystemMetrics(0)
+screen_height = user32.GetSystemMetrics(1)
+
+print(f"Screen size: {screen_width}x{screen_height}")
+
 hwnd = win32gui.FindWindow(None, 'Zoom Meeting')
 
 # Uncomment the following line if you use a high DPI display or >100% scaling size
@@ -12,13 +19,6 @@ hwnd = win32gui.FindWindow(None, 'Zoom Meeting')
 # or just the client area. 
 #left, top, right, bot = win32gui.GetClientRect(hwnd)
 left, top, right, bot = win32gui.GetWindowRect(hwnd)
-
-
-user32 = windll.user32
-screen_width = user32.GetSystemMetrics(0)
-screen_height = user32.GetSystemMetrics(1)
-
-print(f"Screen size: {screen_width}x{screen_height}")
 
 w = 2560
 h = 1580
