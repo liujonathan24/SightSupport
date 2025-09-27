@@ -2,76 +2,125 @@ import win32gui
 import win32ui
 from ctypes import windll
 from PIL import Image
-import logging
+
 from src.helpers import logging_utils
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(funcName)s:%(lineno)d | %(message)s",
-)
+# Setup logging for the app once (optionally add a file)
+logging_utils.setup_logging(name="zoom_app", level=10)  # DEBUG
+log = logging_utils.get_logger("zoom_app")
 
-log = logging.getLogger("zoom_app")
-
+@logging_utils.trace_calls(logger=log)
 def find_window_title_contains(substring: str) -> int | None:
     substring_lower = substring.lower()
-    result = {'hwnd': None}
+    result = {"hwnd": None}
 
     def enum_handler(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
             return
         title = win32gui.GetWindowText(hwnd)
         if title and substring_lower in title.lower():
-            result['hwnd'] = hwnd
-    win32gui.EnumWindows(enum_handler, None)
-    return result['hwnd']
+            if result["hwnd"] is None:
+                result["hwnd"] = hwnd
 
-@trace_class # How do I fix this?
+    win32gui.EnumWindows(enum_handler, None)
+    if result["hwnd"] is None:
+        log.debug("No window title matched substring=%r", substring)
+    else:
+        log.debug("Matched hwnd=%s title=%r", result["hwnd"], win32gui.GetWindowText(result["hwnd"]))
+    return result["hwnd"]
+
+@logging_utils.trace_class(logger=log)
 class Window:
     def __init__(self, args):
         window_name = {
             "Zoom": "Zoom Meeting",
-            "Google Meet": "Google Meet" # Fix.
+            "Google Meet": "Google Meet",
         }
-        hwnd = find_window_title_contains("Zoom Meeting")
+        target_title = window_name.get("Zoom", "Zoom Meeting")
 
-        left, top, right, bot = win32gui.GetClientRect(hwnd)
-        screen_width = (right - left ) * 2
+        self.hwnd = find_window_title_contains(target_title)
+        if not self.hwnd:
+            log.warning("No window found containing %r", target_title)
+            self.image = None
+            # Ensure handles are defined for safe cleanup
+            self.hwndDC = None
+            self.mfcDC = None
+            self.saveDC = None
+            self.saveBitMap = None
+            self._oldBmp = None
+            return
+
+        title = win32gui.GetWindowText(self.hwnd)
+        left, top, right, bot = win32gui.GetClientRect(self.hwnd)
+        screen_width = (right - left) * 2
         screen_height = (bot - top) * 2
 
-        hwnd = find_window_title_contains("Zoom Meeting")
-        if hwnd:
-            title = win32gui.GetWindowText(hwnd)
-            rect = win32gui.GetWindowRect(hwnd)  # (left, top, right, bottom)
-            width = rect[2] - rect[0]
-            height = rect[3] - rect[1]
-            print(f"Found HWND={hwnd}, title='{title}', size=({width}x{height})")
-        else:
-            print("No window found containing 'Zoom Meeting'")
+        rect = win32gui.GetWindowRect(self.hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+        log.info("Found HWND=%s title=%r size=%dx%d", self.hwnd, title, width, height)
+        log.debug("Client area scaled size=%dx%d", screen_width, screen_height)
 
-        print(f"Screen width x height:{screen_width}x{screen_height}")
-        hwndDC = win32gui.GetWindowDC(hwnd)
-        mfcDC  = win32ui.CreateDCFromHandle(hwndDC)
-        saveDC = mfcDC.CreateCompatibleDC()
+        # Create DCs and reusable bitmap buffer
+        self.hwndDC = win32gui.GetWindowDC(self.hwnd)
+        self.mfcDC = win32ui.CreateDCFromHandle(self.hwndDC)
+        self.saveDC = self.mfcDC.CreateCompatibleDC()
 
-        saveBitMap = win32ui.CreateBitmap()
-        saveBitMap.CreateCompatibleBitmap(mfcDC, screen_width, screen_height)
+        self.saveBitMap = win32ui.CreateBitmap()
+        self.saveBitMap.CreateCompatibleBitmap(self.mfcDC, screen_width, screen_height)
 
-        saveDC.SelectObject(saveBitMap)
+        # Select the bitmap into the memory DC; keep old for later restore
+        self._oldBmp = self.saveDC.SelectObject(self.saveBitMap)
 
-        result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)
+        self.size = (screen_width, screen_height)
 
-        bmpinfo = saveBitMap.GetInfo()
-        bmpstr = saveBitMap.GetBitmapBits(True)
+    def get_image(self):
+        # Render latest frame into the offscreen bitmap
+        result = windll.user32.PrintWindow(self.hwnd, self.saveDC.GetSafeHdc(), 3)
+        log.debug("PrintWindow result=%s", result)
+
+        bmpinfo = self.saveBitMap.GetInfo()
+        bmpstr = self.saveBitMap.GetBitmapBits(True)
+        log.debug("Bitmap info: %s", bmpinfo)
 
         im = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1)
+            "RGB",
+            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+            bmpstr,
+            "raw",
+            "BGRX",
+            0,
+            1,
+        )
 
-        win32gui.DeleteObject(saveBitMap.GetHandle())
-        saveDC.DeleteDC()
-        mfcDC.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwndDC)
-        
+        self.image = im
+        return self.image
 
-        return im
+    def close(self):
+        # Proper cleanup: restore selection and delete GDI resources
+        try:
+            if self.saveDC and self._oldBmp:
+                self.saveDC.SelectObject(self._oldBmp)
+        except Exception:
+            pass
+        try:
+            if self.saveBitMap:
+                win32gui.DeleteObject(self.saveBitMap.GetHandle())
+        except Exception:
+            pass
+        try:
+            if self.saveDC:
+                self.saveDC.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if self.mfcDC:
+                self.mfcDC.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if self.hwndDC:
+                win32gui.ReleaseDC(self.hwnd, self.hwndDC)
+        except Exception:
+            pass
+        log.debug("Released GDI resources")
