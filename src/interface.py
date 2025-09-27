@@ -1,6 +1,8 @@
-# ai_console.py
+# interface.py
 
 import streamlit as st
+
+# Run with: streamlit run src/interface.py
 
 # --- Page Config ---
 st.set_page_config(
