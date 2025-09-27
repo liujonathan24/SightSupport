@@ -39,6 +39,7 @@ class Window:
 
         # Gets the meeting title of the desired app, defaults to Zoom otherwise.
         target_title = window_name.get(args.app, "Zoom Meeting")
+        
 
         self.hwnd = find_window_title_contains(target_title)
         if not self.hwnd:
@@ -129,7 +130,11 @@ class Window:
 
 def main(args):
     meeting = Window(args)
-    image = meeting.get_image()
+    i = 0
+    while True:
+        i += 1
+        image = meeting.get_image()
+        image.save(f"tmp/frame_{i}.png")
     
 
 
