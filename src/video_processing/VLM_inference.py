@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 import onnx
 import torch
-from transformers import AutoTokenizer, AutoModelForVision2Seq
+from transformers import AutoTokenizer, AutoModelForImageTextToText
 from qwen_vl_utils import process_vision_info
 import onnxruntime as ort
 
@@ -15,14 +15,30 @@ MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # 1) Load HF model (PyTorch) and tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-model = AutoModelForVision2Seq.from_pretrained(
-    MODEL_ID, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+model = AutoModelForImageTextToText.from_pretrained(
+    MODEL_ID, dtype=torch.float16, device_map="cpu", trust_remote_code=True
 ).eval()
 
 # 2) Prepare sample inputs (text + one image)
 text = "Describe this image."
-img = Image.new("RGB", (640, 480), color=(200, 180, 160))  # replace with a real image path
-vision_inputs = process_vision_info([img])  # returns pixel_values, image_sizes etc.
+img = Image.new("RGB", (560, 420), color=(200, 180, 160))  # replace with a real image path
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": img},
+            {"type": "text", "text": ""}, 
+        ] 
+    }
+]
+pixel_values, image_grid_thw = process_vision_info(messages)  # returns pixel_values, image_sizes etc.
+image_grid_thw = torch.tensor([[1, 15, 20]])
+
+# Manually add original image size if needed
+image_sizes = torch.tensor([[img.height, img.width]])
+print(len(pixel_values))
+pixel_values = torch.tensor(np.array(pixel_values[0]), dtype=torch.uint8)
+print(type(pixel_values), type(image_grid_thw))
 
 # Qwen2.5-VL uses special tokens and projector; build inputs the same way as LMDeploy docs
 inputs = tokenizer(
@@ -40,11 +56,13 @@ with torch.no_grad():
     pt_inputs = dict(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
-        pixel_values=vision_inputs["pixel_values"],
-        image_grid_thw=vision_inputs.get("image_grid_thw", None),
-        image_sizes=vision_inputs.get("image_sizes", None),
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+     
+        # image_sizes=image_sizes,
     )
     pt_inputs = {k: v for k, v in pt_inputs.items() if v is not None}
+    print(pt_inputs)
     out = model(**pt_inputs)
 
 # 4) Export two ONNX graphs:
@@ -69,9 +87,9 @@ vision_to_embeds = VisionToEmbeds(vision_module, projector).eval()
 
 tmpdir = tempfile.mkdtemp()
 vision_onnx = os.path.join(tmpdir, "qwen2p5vl_vision.onnx")
-dummy_pix = vision_inputs["pixel_values"]
-dummy_grid = vision_inputs.get("image_grid_thw", None)
-dummy_sizes = vision_inputs.get("image_sizes", None)
+dummy_pix = pixel_values
+dummy_grid = image_grid_thw
+dummy_sizes = image_sizes
 dynamic_axes = {
     "pixel_values": {0: "batch", 2: "h", 3: "w"},
 }
