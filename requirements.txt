@@ -15,7 +15,6 @@ jsonschema-specifications==2025.9.1
 macholib==1.16.3
 MarkupSafe==3.0.2
 narwhals==2.5.0
-numpy==2.3.3
 packaging==25.0
 pandas==2.3.2
 pillow==11.3.0
