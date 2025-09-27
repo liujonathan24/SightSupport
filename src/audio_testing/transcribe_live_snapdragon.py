@@ -1,61 +1,68 @@
-# live_transcribe_dual_cloud_balanced.py
-# Balanced anti-hallucination setup (not too strict):
-#  - [ME] mic and [SYS] loopback transcribed separately
-#  - 3s windows, 1s overlap (more context than 0-overlap)
-#  - moderate VAD + adaptive energy floor + light crosstalk guard
-#  - temperature=0, language="en"
+# live_transcribe_dual_local_fw.py
+# Fully local dual-stream transcription using faster-whisper:
+#   [ME]  = Microphone (your speech)
+#   [SYS] = System loopback (others/app audio)
+# Mild anti-hallucination settings (not strict), no cloud, no keys.
 # Ctrl+C to stop. Appends to live_transcript.txt
 
-import os, io, sys, time, queue, threading, warnings, collections, difflib
+import sys, time, queue, threading, warnings, difflib, io
 import numpy as np
 import soundcard as sc
 import soundfile as sf
-import webrtcvad
-
-# -------- CONFIG (tuned to be lenient but safer) --------
-SAMPLE_RATE = 16000
-BLOCK_FRAMES = 1024
-
-WIN_SECONDS = 3.0                # window length
-HOP_SECONDS = 2.0                # 1s overlap
-WIN_SAMPLES = int(WIN_SECONDS * SAMPLE_RATE)
-HOP_SAMPLES = int(HOP_SECONDS * SAMPLE_RATE)
-
-# VAD (0..3). 1 is moderate; 2–3 are stricter.
-VAD_AGGR_ME  = 1
-VAD_AGGR_SYS = 1
-SPEECH_RATIO_MIN = 0.20          # only 20% of frames need to be voiced
-
-# Adaptive RMS floor: use 25th percentile of recent RMS * factor
-RMS_RING_SIZE = 40               # ~80s of history at 2s hop per stream
-RMS_FLOOR_FACTOR = 0.9           # a smidge below the quiet baseline
-
-# Light crosstalk guard (small gap to decide dominance)
-CROSSTALK_DB_GAP = 6.0           # dB difference to prefer one stream
-EPS = 1e-12
-
-# Cloud STT
-OPENAI_MODEL = "gpt-4o-mini-transcribe"   # or "whisper-1"
-OPENAI_TIMEOUT = 60
-LANGUAGE = "en"
-TEMPERATURE = 0.0
-
-# Text sanity filter
-MIN_CHARS = 4                    # drop tiny fragments
-MIN_ALPHA_RATIO = 0.5            # require at least 50% alphabetic chars
-SIMILARITY_DROP = 0.92           # drop if ≥92% similar to last line for that stream
-# --------------------------------------------------------
 
 warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
 
+# ---------- Config ----------
+SAMPLE_RATE = 16000
+BLOCK_FRAMES = 1024
+
+# Windowing (balanced): 3s windows, 1s overlap
+WIN_SECONDS = 3.0
+HOP_SECONDS = 2.0
+WIN_SAMPLES = int(WIN_SECONDS * SAMPLE_RATE)
+HOP_SAMPLES = int(HOP_SECONDS * SAMPLE_RATE)
+
+# Light per-block cross-talk guard (prefer dominant stream)
+GATE_RATIO_DB = 6.0
+FLOOR = 1e-9  # numeric floor for dB calc
+
+# Per-window light energy gates (lenient)
+RMS_FLOOR_ME  = 0.0035
+RMS_FLOOR_SYS = 0.0045
+
+# faster-whisper model (local only)
+MODEL_NAME = "base.en"     # "tiny.en" = faster, "small.en" = better/slower
+DEVICE = "cpu"             # Snapdragon has no CUDA; CPU is correct
+COMPUTE_TYPE = "int8"      # fastest on CPU; alternatives: "int8_float16", "float32"
+
+# Text sanity checks (soft)
+MIN_CHARS = 4              # drop tiny fragments
+MIN_ALPHA_RATIO = 0.5      # at least 50% letters
+SIMILARITY_DROP = 0.92     # drop if ≥92% similar to previous line (per stream)
+# ---------------------------
+
+# ---- Import local STT (no cloud) ----
 try:
-    from openai import OpenAI
+    from faster_whisper import WhisperModel
 except Exception as e:
-    print(f"FATAL: openai package missing: {e}")
+    print(f"FATAL: faster-whisper is not available or failed to import: {e}")
+    print("Install with: pip install faster-whisper  (note: Windows-on-ARM wheels may be unavailable)")
     sys.exit(1)
 
-q_me  = queue.Queue()
-q_sys = queue.Queue()
+# Init model up front so failures are obvious
+try:
+    _model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+    print(f"local model ready: {MODEL_NAME} on {DEVICE}/{COMPUTE_TYPE}")
+except Exception as e:
+    print(f"FATAL: failed to initialize faster-whisper: {e}")
+    sys.exit(1)
+
+# --------- Audio plumbing ---------
+speaker = sc.default_speaker()
+microph = sc.default_microphone()
+
+q_me  = queue.Queue()   # mic windows
+q_sys = queue.Queue()   # loopback windows
 stop_flag = threading.Event()
 
 def downmix_mono(x: np.ndarray) -> np.ndarray:
@@ -67,63 +74,15 @@ def energy_rms(x: np.ndarray) -> float:
     if x.size == 0: return 0.0
     return float(np.sqrt(np.mean(np.square(x), dtype=np.float32)))
 
-def db_from_rms(r: float) -> float:
-    return 20.0 * np.log10(max(r, EPS))
-
-def frame_iter_10ms(x_mono16k: np.ndarray):
-    s = np.clip(x_mono16k, -1.0, 1.0).astype(np.float32, copy=False)
-    s16 = (s * 32767.0).astype(np.int16)
-    step = 160  # 10ms @ 16k
-    for i in range(0, len(s16) - step + 1, step):
-        yield s16[i:i+step].tobytes()
-
-def speech_ratio(vad: webrtcvad.Vad, audio_block: np.ndarray) -> float:
-    total = 0
-    voiced = 0
-    for fr in frame_iter_10ms(audio_block):
-        total += 1
-        if vad.is_speech(fr, SAMPLE_RATE):
-            voiced += 1
-    return (voiced / total) if total else 0.0
-
-def wav_bytes_from_mono16k(audio: np.ndarray) -> bytes:
-    bio = io.BytesIO()
-    sf.write(bio, audio, SAMPLE_RATE, subtype="PCM_16", format="WAV")
-    return bio.getvalue()
-
-def check_cloud_init():
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        print("FATAL: OPENAI_API_KEY not set.")
-        return None
-    try:
-        client = OpenAI(timeout=OPENAI_TIMEOUT)
-        # quick warmup
-        silence = np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32)
-        client.audio.transcriptions.create(
-            file=("warmup.wav", wav_bytes_from_mono16k(silence)),
-            model=OPENAI_MODEL, temperature=TEMPERATURE, language=LANGUAGE
-        )
-        return client
-    except Exception as e:
-        print(f"FATAL: cloud init failed: {e}")
-        return None
-
-def cloud_transcribe_fn(client):
-    def transcribe(audio_block_16k: np.ndarray) -> str:
-        resp = client.audio.transcriptions.create(
-            file=("chunk.wav", wav_bytes_from_mono16k(audio_block_16k)),
-            model=OPENAI_MODEL, temperature=TEMPERATURE, language=LANGUAGE
-        )
-        text = getattr(resp, "text", "") or (resp.get("text") if isinstance(resp, dict) else "")
-        return (text or "").strip()
-    return transcribe
+def db(x: float) -> float:
+    x = max(x, FLOOR)
+    return 10.0 * np.log10(x)
 
 def capture_loop():
-    speaker = sc.default_speaker()
-    microph = sc.default_microphone()
-    print(f"default speaker: {speaker.name}")
-    print(f"default microphone: {microph.name}")
+    """
+    Capture loopback (system) + mic.
+    Mild per-block cross-talk gating, then window each stream independently.
+    """
     sys_mic = sc.get_microphone(id=speaker.name, include_loopback=True)
 
     buf_me  = np.zeros(0, dtype=np.float32)
@@ -137,122 +96,126 @@ def capture_loop():
             sys_frames = sys_rec.record(numframes=BLOCK_FRAMES)
             me_frames  = mic_rec.record(numframes=BLOCK_FRAMES)
 
-            buf_sys = np.concatenate([buf_sys, downmix_mono(sys_frames)]).astype(np.float32, copy=False)
-            buf_me  = np.concatenate([buf_me,  downmix_mono(me_frames)]).astype(np.float32, copy=False)
+            sys_mono = downmix_mono(sys_frames)
+            me_mono  = downmix_mono(me_frames)
 
-            while len(buf_me) >= WIN_SAMPLES and len(buf_sys) >= WIN_SAMPLES:
-                q_me.put(buf_me[:WIN_SAMPLES].copy())
-                q_sys.put(buf_sys[:WIN_SAMPLES].copy())
-                buf_me  = buf_me[HOP_SAMPLES:]
+            # Light cross-talk per block
+            e_me, e_sys = energy_rms(me_mono), energy_rms(sys_mono)
+            d_me, d_sys = db(e_me), db(e_sys)
+            if d_me - d_sys >= GATE_RATIO_DB:
+                sys_mono[:] = 0.0
+            elif d_sys - d_me >= GATE_RATIO_DB:
+                me_mono[:] = 0.0
+
+            # Accumulate into per-stream buffers and window
+            buf_me  = np.concatenate([buf_me,  me_mono]).astype(np.float32, copy=False)
+            buf_sys = np.concatenate([buf_sys, sys_mono]).astype(np.float32, copy=False)
+
+            while len(buf_me) >= WIN_SAMPLES:
+                win = buf_me[:WIN_SAMPLES].copy()
+                buf_me = buf_me[HOP_SAMPLES:]
+                if energy_rms(win) >= RMS_FLOOR_ME:
+                    q_me.put(win)
+
+            while len(buf_sys) >= WIN_SAMPLES:
+                win = buf_sys[:WIN_SAMPLES].copy()
                 buf_sys = buf_sys[HOP_SAMPLES:]
+                if energy_rms(win) >= RMS_FLOOR_SYS:
+                    q_sys.put(win)
 
-def worker(tag: str, q: queue.Queue, hop_seconds: float, transcribe_fn):
-    """
-    Per-stream worker with moderate gating:
-      - VAD >= 0.20
-      - adaptive RMS floor using running 25th percentile
-      - light crosstalk drop using the other stream's latest RMS
-    """
-    t_accum = 0.0
-    rms_hist = collections.deque(maxlen=RMS_RING_SIZE)
-    last_text = ""
+# ---------- Transcription (local) ----------
+def transcribe_block(audio_block_16k: np.ndarray) -> str:
+    # No context carry to avoid bleed/hallucinations across windows
+    segments, _ = _model.transcribe(
+        audio_block_16k,
+        language="en",
+        vad_filter=True,
+        condition_on_previous_text=False,
+        beam_size=1,                 # faster, and reduces verbosity
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+    )
+    return "".join(s.text for s in segments).strip()
 
-    # share the other stream's RMS via a simple global (updated by both workers)
-    global last_rms_me, last_rms_sys
-    if tag == "[ME]":
-        other_rms_get = lambda: last_rms_sys
-        set_my_rms    = lambda v: set_last_rms('me', v)
-        vad = webrtcvad.Vad(VAD_AGGR_ME)
-    else:
-        other_rms_get = lambda: last_rms_me
-        set_my_rms    = lambda v: set_last_rms('sys', v)
-        vad = webrtcvad.Vad(VAD_AGGR_SYS)
+def clean_and_emit(tag: str, text: str, t_accum: float, last_text_holder: dict, outfile: str):
+    if not text:
+        return False
+    if len(text) < MIN_CHARS:
+        return False
+    alpha_ratio = sum(c.isalpha() for c in text) / max(len(text), 1)
+    if alpha_ratio < MIN_ALPHA_RATIO:
+        return False
+    last_text = last_text_holder.get(tag, "")
+    if last_text:
+        sim = difflib.SequenceMatcher(None, last_text, text).ratio()
+        if sim >= SIMILARITY_DROP:
+            return False
 
+    stamp = time.strftime("%H:%M:%S", time.gmtime(t_accum))
+    line = f"[{stamp}] {tag} {text}"
+    print(line, flush=True)
     with open("live_transcript.txt", "a", encoding="utf-8") as f:
-        while not stop_flag.is_set():
-            try:
-                audio = q.get(timeout=0.5)
-            except queue.Empty:
-                continue
+        f.write(line + "\n"); f.flush()
+    last_text_holder[tag] = text
+    return True
 
-            # measurements
-            rms_val = energy_rms(audio)
-            set_my_rms(rms_val)
-            rms_hist.append(rms_val)
-            if len(rms_hist) >= 5:
-                floor = np.percentile(rms_hist, 25) * RMS_FLOOR_FACTOR
-            else:
-                floor = 0.0  # lenient at start
+# Shared RMS for light peer dominance check (window-level)
+_last_rms_me  = 0.0
+_last_rms_sys = 0.0
 
-            ratio = speech_ratio(vad, audio)
-            other_db = db_from_rms(other_rms_get() or 0.0)
-            my_db    = db_from_rms(rms_val)
+def transcribe_worker(tag: str, q_in: queue.Queue, hop_seconds: float, peer_rms_get):
+    t_accum = 0.0
+    last_text_holder = {}
+    global _last_rms_me, _last_rms_sys
 
-            # gating (moderate)
-            pass_energy = (rms_val >= floor)
-            pass_vad    = (ratio >= SPEECH_RATIO_MIN)
-            pass_xtalk  = True
-            if (my_db + CROSSTALK_DB_GAP) <= other_db:
-                # other stream is clearly louder → skip this one
-                pass_xtalk = False
+    while not stop_flag.is_set():
+        try:
+            audio = q_in.get(timeout=0.5)
+        except queue.Empty:
+            continue
 
-            if not (pass_energy and pass_vad and pass_xtalk):
-                t_accum += hop_seconds
-                continue  # drop quietly
+        # update my window RMS
+        r = energy_rms(audio)
+        if tag == "[ME]":
+            _last_rms_me = r
+        else:
+            _last_rms_sys = r
 
-            # transcribe
-            try:
-                text = transcribe_fn(audio)
-            except Exception as e:
-                print(f"[warn] {tag} transcribe error: {e}", file=sys.stderr)
-                text = ""
-
-            # text sanity (soft)
-            if text:
-                if len(text) < MIN_CHARS:
-                    text = ""
-                else:
-                    alpha = sum(c.isalpha() for c in text) / max(len(text), 1)
-                    if alpha < MIN_ALPHA_RATIO:
-                        text = ""
-                    elif last_text:
-                        sim = difflib.SequenceMatcher(None, last_text, text).ratio()
-                        if sim >= SIMILARITY_DROP:
-                            text = ""
-
+        # light peer dominance check (drop if peer >> me)
+        my_db   = db(r)
+        peer_db = db(peer_rms_get())
+        if (peer_db - my_db) >= GATE_RATIO_DB:
             t_accum += hop_seconds
-            if text:
-                stamp = time.strftime("%H:%M:%S", time.gmtime(t_accum))
-                line = f"[{stamp}] {tag} {text}"
-                print(line, flush=True)
-                f.write(line + "\n"); f.flush()
-                last_text = text
+            continue
 
-# simple globals for crosstalk check
-last_rms_me  = 0.0
-last_rms_sys = 0.0
-def set_last_rms(which, val):
-    global last_rms_me, last_rms_sys
-    if which == 'me':
-        last_rms_me = val
-    else:
-        last_rms_sys = val
+        # transcribe locally
+        try:
+            text = transcribe_block(audio)
+        except Exception as e:
+            print(f"[warn] {tag} transcribe error: {e}", file=sys.stderr)
+            text = ""
+
+        t_accum += hop_seconds
+        clean_and_emit(tag, text, t_accum, last_text_holder, "live_transcript.txt")
 
 def main():
-    client = check_cloud_init()
-    if client is None:
-        print("diagnostics:")
-        print(" - set OPENAI_API_KEY in this shell")
-        print(" - try OPENAI_MODEL='whisper-1' if access is restricted")
-        sys.exit(1)
-    transcribe_fn = cloud_transcribe_fn(client)
+    print("default speaker:", speaker.name)
+    print("default microphone:", microph.name)
 
     cap = threading.Thread(target=capture_loop, daemon=True)
-    mew = threading.Thread(target=worker, args=("[ME]",  q_me,  HOP_SECONDS, transcribe_fn), daemon=True)
-    sysw = threading.Thread(target=worker, args=("[SYS]", q_sys, HOP_SECONDS, transcribe_fn), daemon=True)
+
+    peer_me  = lambda: _last_rms_me
+    peer_sys = lambda: _last_rms_sys
+
+    me_worker  = threading.Thread(target=transcribe_worker,
+                                  args=("[ME]",  q_me,  HOP_SECONDS, peer_sys),
+                                  daemon=True)
+    sys_worker = threading.Thread(target=transcribe_worker,
+                                  args=("[SYS]", q_sys, HOP_SECONDS, peer_me),
+                                  daemon=True)
 
     print("starting… press Ctrl+C to stop")
-    cap.start(); mew.start(); sysw.start()
+    cap.start(); me_worker.start(); sys_worker.start()
     try:
         while True:
             time.sleep(0.2)
@@ -261,8 +224,8 @@ def main():
     finally:
         stop_flag.set()
         cap.join(timeout=1.0)
-        mew.join(timeout=2.0)
-        sysw.join(timeout=2.0)
+        me_worker.join(timeout=2.0)
+        sys_worker.join(timeout=2.0)
         print("transcript appended to live_transcript.txt")
 
 if __name__ == "__main__":
