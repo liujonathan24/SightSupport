@@ -40,3 +40,8 @@ typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
 wheel==0.45.1
+cffi==2.0.0
+numpy==1.26.4
+pycparser==2.23
+SoundCard==0.4.5
+soundfile==0.13.1
