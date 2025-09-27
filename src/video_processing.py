@@ -3,39 +3,34 @@ import win32ui
 from ctypes import windll
 from PIL import Image
 
-
-user32 = windll.user32
-screen_width = user32.GetSystemMetrics(0)
-screen_height = user32.GetSystemMetrics(1)
-
-print(f"Screen size: {screen_width}x{screen_height}")
-
-hwnd = win32gui.FindWindow(None, 'Zoom Meeting')
+hwnd = win32gui.FindWindow(None, 'Zoom Meeting 40-Minutes ')
 
 # Uncomment the following line if you use a high DPI display or >100% scaling size
 # windll.user32.SetProcessDPIAware()
 
 # Change the line below depending on whether you want the whole window
 # or just the client area. 
-#left, top, right, bot = win32gui.GetClientRect(hwnd)
-left, top, right, bot = win32gui.GetWindowRect(hwnd)
+left, top, right, bot = win32gui.GetClientRect(hwnd)
+# left, top, right, bot = win32gui.GetWindowRect(hwnd)
+screen_width = (right - left ) * 2
+screen_height = (bot - top) * 2
 
-w = 2560
-h = 1580
+
+print(f"Screen width x height:{screen_width}x{screen_height}")
 
 hwndDC = win32gui.GetWindowDC(hwnd)
 mfcDC  = win32ui.CreateDCFromHandle(hwndDC)
 saveDC = mfcDC.CreateCompatibleDC()
 
 saveBitMap = win32ui.CreateBitmap()
-saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+saveBitMap.CreateCompatibleBitmap(mfcDC, screen_width, screen_height)
 
 saveDC.SelectObject(saveBitMap)
 
 # Change the line below depending on whether you want the whole window
 # or just the client area. 
 #result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 1)
-result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)
 print(result)
 
 bmpinfo = saveBitMap.GetInfo()
