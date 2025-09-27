@@ -1,68 +1,42 @@
-# live_transcribe_dual_local_fw.py
-# Fully local dual-stream transcription using faster-whisper:
-#   [ME]  = Microphone (your speech)
-#   [SYS] = System loopback (others/app audio)
-# Mild anti-hallucination settings (not strict), no cloud, no keys.
-# Ctrl+C to stop. Appends to live_transcript.txt
+# live_transcribe_dual_local_whispercpp.py
+# Fully-local dual captions on Snapdragon:
+#   [ME]  = mic
+#   [SYS] = system loopback
+# Uses whisper.cpp CLI (no internet, no keys). Mild anti-hallucination.
 
-import sys, time, queue, threading, warnings, difflib, io
+import os, sys, time, queue, threading, warnings, tempfile, pathlib, subprocess, io
 import numpy as np
 import soundcard as sc
 import soundfile as sf
 
-warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
+# ---- EDIT THESE PATHS IF NEEDED ----
+WHISPER_EXE   = r"C:\whispercpp\main.exe"
+WHISPER_MODEL = r"C:\whispercpp\models\ggml-base.en.bin"
+LANGUAGE      = "en"
+# ------------------------------------
 
-# ---------- Config ----------
-SAMPLE_RATE = 16000
+SAMPLE_RATE  = 16000
 BLOCK_FRAMES = 1024
 
-# Windowing (balanced): 3s windows, 1s overlap
-WIN_SECONDS = 3.0
-HOP_SECONDS = 2.0
-WIN_SAMPLES = int(WIN_SECONDS * SAMPLE_RATE)
-HOP_SAMPLES = int(HOP_SECONDS * SAMPLE_RATE)
+# Balanced context/latency
+WIN_SECONDS  = 3.0
+HOP_SECONDS  = 2.0
+WIN_SAMPLES  = int(WIN_SECONDS * SAMPLE_RATE)
+HOP_SAMPLES  = int(HOP_SECONDS * SAMPLE_RATE)
 
-# Light per-block cross-talk guard (prefer dominant stream)
-GATE_RATIO_DB = 6.0
-FLOOR = 1e-9  # numeric floor for dB calc
-
-# Per-window light energy gates (lenient)
+# Mild anti-hallucination (lenient)
 RMS_FLOOR_ME  = 0.0035
 RMS_FLOOR_SYS = 0.0045
+CROSSTALK_DB_GAP = 6.0
+EPS = 1e-12
 
-# faster-whisper model (local only)
-MODEL_NAME = "base.en"     # "tiny.en" = faster, "small.en" = better/slower
-DEVICE = "cpu"             # Snapdragon has no CUDA; CPU is correct
-COMPUTE_TYPE = "int8"      # fastest on CPU; alternatives: "int8_float16", "float32"
+# whisper.cpp flags: -nt (no timestamps) to print just text to stdout, -np (no progress)
+WHISPER_FLAGS = ["-nt", "-np", "-l", LANGUAGE]
 
-# Text sanity checks (soft)
-MIN_CHARS = 4              # drop tiny fragments
-MIN_ALPHA_RATIO = 0.5      # at least 50% letters
-SIMILARITY_DROP = 0.92     # drop if ≥92% similar to previous line (per stream)
-# ---------------------------
+warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
 
-# ---- Import local STT (no cloud) ----
-try:
-    from faster_whisper import WhisperModel
-except Exception as e:
-    print(f"FATAL: faster-whisper is not available or failed to import: {e}")
-    print("Install with: pip install faster-whisper  (note: Windows-on-ARM wheels may be unavailable)")
-    sys.exit(1)
-
-# Init model up front so failures are obvious
-try:
-    _model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print(f"local model ready: {MODEL_NAME} on {DEVICE}/{COMPUTE_TYPE}")
-except Exception as e:
-    print(f"FATAL: failed to initialize faster-whisper: {e}")
-    sys.exit(1)
-
-# --------- Audio plumbing ---------
-speaker = sc.default_speaker()
-microph = sc.default_microphone()
-
-q_me  = queue.Queue()   # mic windows
-q_sys = queue.Queue()   # loopback windows
+q_me  = queue.Queue()
+q_sys = queue.Queue()
 stop_flag = threading.Event()
 
 def downmix_mono(x: np.ndarray) -> np.ndarray:
@@ -74,23 +48,37 @@ def energy_rms(x: np.ndarray) -> float:
     if x.size == 0: return 0.0
     return float(np.sqrt(np.mean(np.square(x), dtype=np.float32)))
 
-def db(x: float) -> float:
-    x = max(x, FLOOR)
-    return 10.0 * np.log10(x)
+def db_from_rms(r: float) -> float:
+    return 20.0 * np.log10(max(r, EPS))
+
+def run_whispercpp_block(audio: np.ndarray) -> str:
+    """Write a temp WAV, call whisper.cpp, return stdout text."""
+    tmp_dir = pathlib.Path(tempfile.gettempdir()) / "whisper_live"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = tmp_dir / f"chunk_{int(time.time()*1000)}.wav"
+    sf.write(str(wav_path), audio, SAMPLE_RATE, subtype="PCM_16")
+    try:
+        cmd = [WHISPER_EXE, "-m", WHISPER_MODEL, "-f", str(wav_path)] + WHISPER_FLAGS
+        out = subprocess.check_output(cmd, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        text = out.decode("utf-8", errors="ignore").strip()
+    except subprocess.CalledProcessError:
+        text = ""
+    finally:
+        try: wav_path.unlink(missing_ok=True)
+        except Exception: pass
+    return text
 
 def capture_loop():
-    """
-    Capture loopback (system) + mic.
-    Mild per-block cross-talk gating, then window each stream independently.
-    """
-    sys_mic = sc.get_microphone(id=speaker.name, include_loopback=True)
+    speaker = sc.default_speaker()
+    microph = sc.default_microphone()
+    print("default speaker:", speaker.name)
+    print("default microphone:", microph.name)
 
-    buf_me  = np.zeros(0, dtype=np.float32)
-    buf_sys = np.zeros(0, dtype=np.float32)
+    sys_mic = sc.get_microphone(id=speaker.name, include_loopback=True)
+    buf_me, buf_sys = np.zeros(0, np.float32), np.zeros(0, np.float32)
 
     with sys_mic.recorder(samplerate=SAMPLE_RATE, channels=2) as sys_rec, \
          microph.recorder(samplerate=SAMPLE_RATE, channels=1) as mic_rec:
-
         print("capture started; 3s windows / 1s overlap")
         while not stop_flag.is_set():
             sys_frames = sys_rec.record(numframes=BLOCK_FRAMES)
@@ -99,15 +87,14 @@ def capture_loop():
             sys_mono = downmix_mono(sys_frames)
             me_mono  = downmix_mono(me_frames)
 
-            # Light cross-talk per block
-            e_me, e_sys = energy_rms(me_mono), energy_rms(sys_mono)
-            d_me, d_sys = db(e_me), db(e_sys)
-            if d_me - d_sys >= GATE_RATIO_DB:
+            # light per-block crosstalk guard
+            d_me  = db_from_rms(energy_rms(me_mono))
+            d_sys = db_from_rms(energy_rms(sys_mono))
+            if d_me - d_sys >= CROSSTALK_DB_GAP:
                 sys_mono[:] = 0.0
-            elif d_sys - d_me >= GATE_RATIO_DB:
+            elif d_sys - d_me >= CROSSTALK_DB_GAP:
                 me_mono[:] = 0.0
 
-            # Accumulate into per-stream buffers and window
             buf_me  = np.concatenate([buf_me,  me_mono]).astype(np.float32, copy=False)
             buf_sys = np.concatenate([buf_sys, sys_mono]).astype(np.float32, copy=False)
 
@@ -123,99 +110,42 @@ def capture_loop():
                 if energy_rms(win) >= RMS_FLOOR_SYS:
                     q_sys.put(win)
 
-# ---------- Transcription (local) ----------
-def transcribe_block(audio_block_16k: np.ndarray) -> str:
-    # No context carry to avoid bleed/hallucinations across windows
-    segments, _ = _model.transcribe(
-        audio_block_16k,
-        language="en",
-        vad_filter=True,
-        condition_on_previous_text=False,
-        beam_size=1,                 # faster, and reduces verbosity
-        no_speech_threshold=0.6,
-        log_prob_threshold=-1.0,
-    )
-    return "".join(s.text for s in segments).strip()
-
-def clean_and_emit(tag: str, text: str, t_accum: float, last_text_holder: dict, outfile: str):
-    if not text:
-        return False
-    if len(text) < MIN_CHARS:
-        return False
-    alpha_ratio = sum(c.isalpha() for c in text) / max(len(text), 1)
-    if alpha_ratio < MIN_ALPHA_RATIO:
-        return False
-    last_text = last_text_holder.get(tag, "")
-    if last_text:
-        sim = difflib.SequenceMatcher(None, last_text, text).ratio()
-        if sim >= SIMILARITY_DROP:
-            return False
-
-    stamp = time.strftime("%H:%M:%S", time.gmtime(t_accum))
-    line = f"[{stamp}] {tag} {text}"
-    print(line, flush=True)
-    with open("live_transcript.txt", "a", encoding="utf-8") as f:
-        f.write(line + "\n"); f.flush()
-    last_text_holder[tag] = text
-    return True
-
-# Shared RMS for light peer dominance check (window-level)
-_last_rms_me  = 0.0
-_last_rms_sys = 0.0
-
-def transcribe_worker(tag: str, q_in: queue.Queue, hop_seconds: float, peer_rms_get):
+def worker(tag: str, q_in: queue.Queue, hop_seconds: float):
     t_accum = 0.0
-    last_text_holder = {}
-    global _last_rms_me, _last_rms_sys
+    with open("live_transcript.txt", "a", encoding="utf-8") as f:
+        while not stop_flag.is_set():
+            try:
+                audio = q_in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                text = run_whispercpp_block(audio)
+            except Exception as e:
+                text = ""
+                print(f"[warn] {tag} transcribe error: {e}", file=sys.stderr)
 
-    while not stop_flag.is_set():
-        try:
-            audio = q_in.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        # update my window RMS
-        r = energy_rms(audio)
-        if tag == "[ME]":
-            _last_rms_me = r
-        else:
-            _last_rms_sys = r
-
-        # light peer dominance check (drop if peer >> me)
-        my_db   = db(r)
-        peer_db = db(peer_rms_get())
-        if (peer_db - my_db) >= GATE_RATIO_DB:
             t_accum += hop_seconds
-            continue
-
-        # transcribe locally
-        try:
-            text = transcribe_block(audio)
-        except Exception as e:
-            print(f"[warn] {tag} transcribe error: {e}", file=sys.stderr)
-            text = ""
-
-        t_accum += hop_seconds
-        clean_and_emit(tag, text, t_accum, last_text_holder, "live_transcript.txt")
+            if text:
+                stamp = time.strftime("%H:%M:%S", time.gmtime(t_accum))
+                line = f"[{stamp}] {tag} {text}"
+                print(line, flush=True)
+                f.write(line + "\n"); f.flush()
 
 def main():
-    print("default speaker:", speaker.name)
-    print("default microphone:", microph.name)
+    # upfront checks so failures are obvious
+    if not os.path.exists(WHISPER_EXE):
+        print(f"FATAL: whisper.cpp executable not found at {WHISPER_EXE}")
+        sys.exit(1)
+    if not os.path.exists(WHISPER_MODEL):
+        print(f"FATAL: model file not found at {WHISPER_MODEL}")
+        sys.exit(1)
 
     cap = threading.Thread(target=capture_loop, daemon=True)
-
-    peer_me  = lambda: _last_rms_me
-    peer_sys = lambda: _last_rms_sys
-
-    me_worker  = threading.Thread(target=transcribe_worker,
-                                  args=("[ME]",  q_me,  HOP_SECONDS, peer_sys),
-                                  daemon=True)
-    sys_worker = threading.Thread(target=transcribe_worker,
-                                  args=("[SYS]", q_sys, HOP_SECONDS, peer_me),
-                                  daemon=True)
+    mew = threading.Thread(target=worker, args=("[ME]",  q_me,  HOP_SECONDS), daemon=True)
+    sysw = threading.Thread(target=worker, args=("[SYS]", q_sys, HOP_SECONDS), daemon=True)
 
     print("starting… press Ctrl+C to stop")
-    cap.start(); me_worker.start(); sys_worker.start()
+    cap.start(); mew.start(); sysw.start()
     try:
         while True:
             time.sleep(0.2)
@@ -224,8 +154,8 @@ def main():
     finally:
         stop_flag.set()
         cap.join(timeout=1.0)
-        me_worker.join(timeout=2.0)
-        sys_worker.join(timeout=2.0)
+        mew.join(timeout=2.0)
+        sysw.join(timeout=2.0)
         print("transcript appended to live_transcript.txt")
 
 if __name__ == "__main__":
