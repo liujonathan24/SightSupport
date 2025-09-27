@@ -2,7 +2,7 @@ import win32gui
 import win32ui
 from ctypes import windll
 from PIL import Image
-
+import argparse
 from src.helpers import logging_utils
 
 # Setup logging for the app once (optionally add a file)
@@ -36,7 +36,9 @@ class Window:
             "Zoom": "Zoom Meeting",
             "Google Meet": "Google Meet",
         }
-        target_title = window_name.get("Zoom", "Zoom Meeting")
+
+        # Gets the meeting title of the desired app, defaults to Zoom otherwise.
+        target_title = window_name.get(args.app, "Zoom Meeting")
 
         self.hwnd = find_window_title_contains(target_title)
         if not self.hwnd:
@@ -124,3 +126,18 @@ class Window:
         except Exception:
             pass
         log.debug("Released GDI resources")
+
+def main(args):
+    meeting = Window(args)
+    image = meeting.get_image()
+    
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+                prog='Window Capture',
+                description='Tests the Window class and its ability to capture images')
+    parser.add_argument("--app", "-a", default="Zoom", help="Meeting application")
+    args = parser.parse_args() 
+
+    main(args)
