@@ -1,58 +1,66 @@
 import sys
 import keyboard
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QCheckBox, QVBoxLayout, QFrame, QRadioButton, QButtonGroup
+    QApplication, QWidget, QLabel, QCheckBox, QVBoxLayout, QFrame, QRadioButton,
+    QButtonGroup, QLineEdit, QTextEdit
 )
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QRect
 from PyQt5.QtGui import QFont
+
 
 class HUD(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Basic sizes
+        # --- Basic sizes ---
         self.default_width = 650
-        self.default_height = 160
-        self.settings_height = 0  # will compute dynamically
+        self.default_height = 200
+        self.settings_height = 0
         self.setGeometry(100, 100, self.default_width, self.default_height)
 
-        # Window flags
+        # --- Window flags ---
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
-        # Fonts
+        # --- Fonts ---
         self.base_font = QFont("Poppins", 15) if QFont("Poppins").exactMatch() else QFont("Segoe UI", 15)
 
-        # Main label
+        # --- Main HUD label ---
         self.label = QLabel("", self)
         self.label.setFont(QFont(self.base_font.family(), 18))
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
 
-        # Styles
+        # --- Input/output boxes (always created upfront) ---
+        # Larger input box height and wider so user can see comfortably
+        self.input_box = QLineEdit(self)
+        self.input_box.setPlaceholderText("Type your question here...")
+        self.input_box.setFont(QFont(self.base_font.family(), 15))
+        self.input_box.returnPressed.connect(self.store_question)
+        # Make sure it can accept multiple visible characters; we'll adjust geometry in reposition_boxes
+
+        self.output_box = QTextEdit(self)
+        self.output_box.setReadOnly(True)
+        self.output_box.setFont(QFont(self.base_font.family(), 14))
+
+        # --- Styles ---
         self.dark_style = (
-            "color: white; "
-            "background-color: rgba(40,40,40,220); "
-            "padding: 18px; "
-            "border-radius: 20px; "
-            "border: 2px solid rgba(255,255,255,60);"
+            "color: white; background-color: rgba(40,40,40,220); "
+            "padding: 18px; border-radius: 20px; border: 2px solid rgba(255,255,255,60);"
         )
         self.light_style = (
-            "color: black; "
-            "background-color: rgba(245,245,245,230); "
-            "padding: 18px; "
-            "border-radius: 20px; "
-            "border: 2px solid rgba(0,0,0,40);"
+            "color: black; background-color: rgba(245,245,245,230); "
+            "padding: 18px; border-radius: 20px; border: 2px solid rgba(0,0,0,40);"
         )
 
-        # Settings frame
+        # --- Settings frame ---
         self.settings_frame = QFrame(self)
         self.settings_frame.setGeometry(0, self.default_height, self.default_width, 0)
         self.settings_layout = QVBoxLayout(self.settings_frame)
         self.settings_layout.setContentsMargins(20, 20, 20, 20)
         self.settings_layout.setSpacing(12)
 
-        # Settings state dict
+        # --- Settings state dict ---
         self.settings_state = {}
         options = [
             ("Enable Dark Mode", True),
@@ -67,7 +75,7 @@ class HUD(QWidget):
         self.checkboxes = {}
         for text, default in options:
             cb = QCheckBox(text)
-            cb.setFont(QFont(self.base_font.family(), 14))  # slightly smaller
+            cb.setFont(QFont(self.base_font.family(), 14))
             cb.setChecked(default)
             cb.stateChanged.connect(lambda state, t=text: self.update_setting(t, state))
             cb.setStyleSheet(self.checkbox_style())
@@ -77,8 +85,6 @@ class HUD(QWidget):
 
         # --- Data Collection Mode Section ---
         self.settings_layout.addSpacing(15)
-
-        # Container for Data Collection Mode
         self.mode_container = QFrame(self.settings_frame)
         self.mode_container_layout = QVBoxLayout(self.mode_container)
         self.mode_container_layout.setContentsMargins(10, 10, 10, 10)
@@ -97,7 +103,6 @@ class HUD(QWidget):
         self.radio_manual = QRadioButton("Manual (Alt+D start/stop)")
         self.radio_smart = QRadioButton("Smart Prompt")
 
-        # Slightly smaller font
         for rb in [self.radio_live, self.radio_manual, self.radio_smart]:
             rb.setFont(QFont(self.base_font.family(), 14))
             rb.setStyleSheet(self.radio_style())
@@ -114,23 +119,34 @@ class HUD(QWidget):
         self.radio_manual.toggled.connect(lambda: self.set_data_mode("Manual"))
         self.radio_smart.toggled.connect(lambda: self.set_data_mode("Smart Prompt"))
 
-        self.apply_theme()
-
-        # Track last non-settings message
+        # --- Track last non-settings message ---
         self.last_message = "What would you like to ask me?"
 
-        # Animation setup
-        self.animation = QPropertyAnimation(self.settings_frame, b"geometry")
-        self.animation.setDuration(300)  # ms
+        # Store questions
+        self.questions = []
 
-        # Hotkeys
+        # --- Animation ---
+        self.animation = QPropertyAnimation(self.settings_frame, b"geometry")
+        self.animation.setDuration(300)
+
+        # --- Hotkeys ---
+        # Use QTimer.singleShot in callbacks to ensure GUI thread runs these safely
         keyboard.add_hotkey("alt+d", lambda: QTimer.singleShot(0, self.show_alt_d))
         keyboard.add_hotkey("alt+x", lambda: QTimer.singleShot(0, self.show_alt_x))
         keyboard.add_hotkey("alt+z", lambda: QTimer.singleShot(0, self.toggle_settings))
+        keyboard.add_hotkey("alt+b", lambda: QTimer.singleShot(0, self.terminate_hud))
 
-        self.show_message(self.last_message)
+        # --- Apply theme ---
+        self.apply_theme()
+
+        # --- Start on Alt+X page (default) ---
+        # Use the same logic as the hotkey to ensure consistent behavior
+        self.show_alt_x()
+
+        # show window
         self.show()
 
+    # --- Styles ---
     def checkbox_style(self):
         return (
             "QCheckBox { padding: 6px; color: white; }"
@@ -145,6 +161,7 @@ class HUD(QWidget):
             "QRadioButton::indicator:checked { background-color: rgba(255,255,255,180); border: 2px solid rgba(255,255,255,200); }"
         )
 
+    # --- Settings and theme ---
     def compute_settings_height(self):
         total_height = 0
         for i in range(self.settings_layout.count()):
@@ -159,17 +176,19 @@ class HUD(QWidget):
         if dark:
             self.label.setStyleSheet(self.dark_style)
             self.settings_frame.setStyleSheet(
-                f"background-color: rgba(40,40,40,220); border-radius: 20px; border: 2px solid rgba(255,255,255,60);"
+                "background-color: rgba(40,40,40,220); border-radius: 20px; border: 2px solid rgba(255,255,255,60);"
             )
             cb_color = "white"
             container_bg = "rgba(80,80,80,150)"
+            input_bg = "rgba(40,40,40,220); color: white;"
         else:
             self.label.setStyleSheet(self.light_style)
             self.settings_frame.setStyleSheet(
-                f"background-color: rgba(245,245,245,230); border-radius: 20px; border: 2px solid rgba(0,0,0,40);"
+                "background-color: rgba(245,245,245,230); border-radius: 20px; border: 2px solid rgba(0,0,0,40);"
             )
             cb_color = "black"
             container_bg = "rgba(200,200,200,150)"
+            input_bg = "rgba(245,245,245,230); color: black;"
 
         for cb in self.checkboxes.values():
             cb.setStyleSheet(self.checkbox_style().replace("white", cb_color))
@@ -178,6 +197,12 @@ class HUD(QWidget):
         self.mode_label.setStyleSheet(f"color: {cb_color}; font-size: 15px; font-weight: bold;")
         self.mode_container.setStyleSheet(f"background-color: {container_bg}; border-radius: 12px;")
 
+        # style input/output so they match theme
+        # use padding + background color string (already includes color)
+        self.input_box.setStyleSheet(f"border-radius: 10px; padding: 8px; background-color: {input_bg}")
+        self.output_box.setStyleSheet(f"border-radius: 10px; padding: 8px; background-color: {input_bg}")
+
+    # --- Settings updates ---
     def update_setting(self, setting_name, state):
         self.settings_state[setting_name] = (state == Qt.Checked)
         if setting_name == "Enable Dark Mode":
@@ -186,17 +211,39 @@ class HUD(QWidget):
     def set_data_mode(self, mode_name):
         self.settings_state["Data Collection Mode"] = mode_name
 
+    # --- Hotkey functions ---
     def show_alt_d(self):
+        # hide input/output and show the message
+        self.input_box.hide()
+        self.output_box.hide()
         if self.settings_frame.height() > 0:
             self.animate_settings(False)
         self.show_message("Alt D was pressed!")
 
     def show_alt_x(self):
+        # always hide settings when opening Alt+X view
         if self.settings_frame.height() > 0:
             self.animate_settings(False)
+
+        # set main message first so label sizing is correct
         self.show_message("What would you like to ask me?")
 
+        # then show and position input/output boxes
+        self.input_box.show()
+        self.output_box.show()
+
+        # make sure boxes are above other widgets and get focus for typing
+        self.input_box.raise_()
+        self.output_box.raise_()
+        self.input_box.setFocus()
+
+        # reposition and resize boxes to be larger and clear
+        self.reposition_boxes()
+
     def toggle_settings(self):
+        # hide input/output when entering settings
+        self.input_box.hide()
+        self.output_box.hide()
         if self.settings_frame.height() == 0:
             self.compute_settings_height()
             self.show_message("Settings")
@@ -205,36 +252,65 @@ class HUD(QWidget):
             self.animate_settings(False)
             self.show_message(self.last_message)
 
+    # --- Animation ---
     def animate_settings(self, opening):
         label_height = self.label.height() + 30
         start_rect = QRect(0, label_height, self.default_width, self.settings_frame.height())
         end_height = self.settings_height if opening else 0
         end_rect = QRect(0, label_height, self.default_width, end_height)
-
         self.animation.stop()
         self.animation.setStartValue(start_rect)
         self.animation.setEndValue(end_rect)
         self.animation.start()
-
         total_height = label_height + (self.settings_height if opening else 0)
         self.setGeometry(100, 100, self.default_width, max(self.default_height, total_height))
 
+    # --- Display message ---
     def show_message(self, message):
         self.label.setText(message)
         self.label.setFixedWidth(self.default_width)
         self.label.adjustSize()
         text_height = self.label.height() + 30
-
-        self.settings_frame.setGeometry(
-            0, text_height, self.default_width, self.settings_frame.height()
-        )
-
-        self.setGeometry(
-            100, 100, self.default_width, max(self.default_height, text_height + self.settings_frame.height())
-        )
-
+        # update settings frame geometry relative to label
+        self.settings_frame.setGeometry(0, text_height, self.default_width, self.settings_frame.height())
+        # reposition input/output if they are visible
+        self.reposition_boxes()
+        # set overall HUD height to include settings (if open)
+        self.setGeometry(100, 100, self.default_width, max(self.default_height, text_height + self.settings_frame.height()))
         if message != "Settings":
             self.last_message = message
+
+    # --- Reposition input/output boxes ---
+    def reposition_boxes(self):
+        # position below the label and make input noticeably larger than before
+        label_height = self.label.height() + 36
+        input_height = 48   # larger input box
+        output_height = 140  # larger output box for readability
+        gap = 12
+        left = 20
+        width = self.default_width - (left * 2)
+
+        # set geometry only if boxes exist
+        if hasattr(self, "input_box") and hasattr(self, "output_box"):
+            self.input_box.setGeometry(left, label_height, width, input_height)
+            self.output_box.setGeometry(left, label_height + input_height + gap, width, output_height)
+
+            # expand window height if needed so boxes are fully visible
+            needed_height = label_height + input_height + gap + output_height + 20
+            current_top = 100  # fixed top
+            self.setGeometry(current_top, 100, self.default_width, max(self.default_height, needed_height))
+
+    # --- Store user question ---
+    def store_question(self):
+        question = self.input_box.text().strip()
+        if question:
+            self.questions.append(question)
+            self.output_box.append(f"Q: {question}")
+            self.input_box.clear()
+
+    # --- Terminate ---
+    def terminate_hud(self):
+        QApplication.quit()
 
 
 if __name__ == "__main__":
