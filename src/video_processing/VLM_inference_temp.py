@@ -1,32 +1,33 @@
 # Windows on ARM64 only. Python 3.11 recommended.
-# pip install onnx onnxruntime-qnn "transformers>=4.49.0" qwen-vl-utils pillow requests numpy torch
+# pip install --upgrade "transformers>=4.49.0" qwen-vl-utils pillow numpy onnx onnxruntime onnxruntime-qnn torch
 
 import os
+import math
 import tempfile
 import numpy as np
 from PIL import Image
+
 import onnx
 import torch
 import onnxruntime as ort
 
-# CHANGED: use the official processor + model class
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-# 1) Load HF model and processor
-# CHANGED: processor instead of tokenizer; model class specific to Qwen2.5-VL
+# 1) Load model + processor
+# - torch_dtype: float32 is safest on CPU; use bfloat16/float16 only if you know your hardware supports it end-to-end.
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float32,  # CHANGED: safe on CPU
+    torch_dtype=torch.float32,
     device_map="cpu",
 ).eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-# 2) Prepare sample inputs (text + one image)
+# 2) Prepare inputs (messages -> processor -> tensors)
 text = "Describe this image."
-img = Image.new("RGB", (560, 420), color=(200, 180, 160))
+img = Image.new("RGB", (560, 420), color=(200, 180, 160))  # replace with a real image if you like
 
 messages = [
     {
@@ -38,13 +39,13 @@ messages = [
     }
 ]
 
-# CHANGED: let the processor build the chat with image placeholders
+# Build prompt with the image placeholder tokens
 prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
-# CHANGED: let the helper gather visual inputs
+# Gather vision I/O from messages (works for images and videos)
 image_inputs, video_inputs = process_vision_info(messages)
 
-# CHANGED: one call that returns consistent pixel_values + image_grid_thw (+ sizes if needed)
+# Create the final, consistent tensor bundle
 inputs = processor(
     text=[prompt],
     images=image_inputs,
@@ -53,24 +54,41 @@ inputs = processor(
     return_tensors="pt",
 )
 
-# Optional sanity check: placeholder tokens vs grid area
-if hasattr(model.config, "image_token_id") and "input_ids" in inputs:
-    n_img_tokens = (inputs["input_ids"] == model.config.image_token_id).sum().item()
-    H = inputs["image_grid_thw"][0, 1].item()
-    W = inputs["image_grid_thw"][0, 2].item()
-    assert n_img_tokens == H * W, f"Mismatch: tokens={n_img_tokens}, grid={H}x{W}"
-
-# 3) Forward once to confirm things run
+# 3) Quick forward to validate and to surface any dtype/shape issues immediately
 with torch.no_grad():
-    out = model(**inputs)
+    _out = model(**inputs)
 
-# 4) Export two ONNX graphs
-# 4a) Vision encoder+projector -> vision_embeds
+# 4) Sanity readout: grid vs tokens (Qwen2.5-VL compresses patches; tokens != H*W)
+if "image_grid_thw" in inputs:
+    T, H, W = inputs["image_grid_thw"][0].tolist()
+    grid_area = T * H * W
+    if hasattr(model.config, "image_token_id"):
+        n_image_tokens = (inputs["input_ids"] == model.config.image_token_id).sum().item()
+        if n_image_tokens > 0:
+            pack = grid_area / n_image_tokens
+            print(f"grid={T}x{H}x{W}={grid_area}, image_tokens={n_image_tokens}, pack_factor≈{pack:.2f}")
+        else:
+            print("No image placeholder tokens found in input_ids.")
 
-# CHANGED: get the actual vision tower and projector from the model
-# Accessors are provided by trust_remote_code in HF Qwen repos
-vision_module = model.get_vision_tower()
-projector = model.get_vision_projector()
+# 5) Build exportable submodules
+
+# Accessors for the visual tower and projector; trust_remote_code models provide helpers.
+def get_vision_tower(m):
+    if hasattr(m, "get_vision_tower"):
+        return m.get_vision_tower()
+    if hasattr(m, "vision_tower"):
+        return m.vision_tower
+    raise RuntimeError("Vision tower accessor not found on model.")
+
+def get_vision_projector(m):
+    if hasattr(m, "get_vision_projector"):
+        return m.get_vision_projector()
+    if hasattr(m, "vision_proj") or hasattr(m, "multi_modal_projector"):
+        return getattr(m, "vision_proj", getattr(m, "multi_modal_projector"))
+    raise RuntimeError("Vision projector accessor not found on model.")
+
+vision_module = get_vision_tower(model)
+projector = get_vision_projector(model)
 
 class VisionToEmbeds(torch.nn.Module):
     def __init__(self, vt, proj):
@@ -78,53 +96,65 @@ class VisionToEmbeds(torch.nn.Module):
         self.vt = vt
         self.proj = proj
     def forward(self, pixel_values, image_grid_thw=None, image_sizes=None):
+        # The vision tower returns per-frame features using grid meta
         feats = self.vt(pixel_values=pixel_values, image_grid_thw=image_grid_thw, image_sizes=image_sizes)
-        embeds = self.proj(feats)
+        embeds = self.proj(feats)  # compressed/packed visual tokens projected into LLM space
         return embeds
 
 vision_to_embeds = VisionToEmbeds(vision_module, projector).eval()
 
+# 6) Collect dummy tensors (exact ones produced by processor) for ONNX tracing
+dummy_pix   = inputs["pixel_values"]                         # float32
+dummy_grid  = inputs.get("image_grid_thw", None)             # Long[int64], shape (N, 3) with [T, H, W]
+dummy_sizes = inputs.get("image_sizes", None)                # Long[int64], shape (N, 2) with [orig_h, orig_w]
+dummy_ids   = inputs["input_ids"]
+dummy_mask  = inputs["attention_mask"]
+
+# Precompute a sample vision_embeds for decoding export
+with torch.no_grad():
+    dummy_embeds = vision_to_embeds(
+        dummy_pix,
+        image_grid_thw=dummy_grid if dummy_grid is not None else None,
+        image_sizes=dummy_sizes if dummy_sizes is not None else None,
+    )
+
+# 7) Export ONNX models
 tmpdir = tempfile.mkdtemp()
 vision_onnx = os.path.join(tmpdir, "qwen2p5vl_vision.onnx")
+llm_onnx    = os.path.join(tmpdir, "qwen2p5vl_decode.onnx")
 
-# CHANGED: take dummies directly from processor outputs (correct dtypes/shapes)
-dummy_pix = inputs["pixel_values"]                        # float tensor as expected by the tower
-dummy_grid = inputs.get("image_grid_thw", None)
-dummy_sizes = inputs.get("image_sizes", None)
-
-dynamic_axes = {
+# 7a) Vision ONNX: (pixel_values, image_grid_thw?, image_sizes?) -> vision_embeds
+vision_input_names = ["pixel_values"]
+vision_inputs = [dummy_pix]
+vision_dynamic_axes = {
     "pixel_values": {0: "batch", 2: "h", 3: "w"},
 }
-input_names = ["pixel_values"]
-input_tensors = [dummy_pix]
 if dummy_grid is not None:
-    input_names.append("image_grid_thw")
-    input_tensors.append(dummy_grid)
+    vision_input_names.append("image_grid_thw")
+    vision_inputs.append(dummy_grid)
 if dummy_sizes is not None:
-    input_names.append("image_sizes")
-    input_tensors.append(dummy_sizes)
+    vision_input_names.append("image_sizes")
+    vision_inputs.append(dummy_sizes)
 
 torch.onnx.export(
     vision_to_embeds,
-    tuple(input_tensors),
+    tuple(vision_inputs),
     vision_onnx,
-    input_names=input_names,
+    input_names=vision_input_names,
     output_names=["vision_embeds"],
     opset_version=17,
-    dynamic_axes=dynamic_axes,
+    dynamic_axes=vision_dynamic_axes,
 )
-
 onnx.checker.check_model(onnx.load(vision_onnx))
+print(f"Exported: {vision_onnx}")
 
-# 4b) LLM decode graph: (input_ids, attention_mask, vision_embeds) -> logits
-# CHANGED: avoid nonstandard generate_logits; just call the model and return .logits
-
+# 7b) Decode ONNX: (input_ids, attention_mask, vision_embeds, image_grid_thw?, image_sizes?) -> logits
+# Many trust_remote_code builds accept vision_embeds directly; we call model(...) and return .logits
 class VLDecode(torch.nn.Module):
     def __init__(self, m):
         super().__init__()
         self.m = m
     def forward(self, input_ids, attention_mask, vision_embeds, image_grid_thw=None, image_sizes=None):
-        # The model expects image info through kwargs. We pass embeds explicitly and skip pixel_values.
         out = self.m(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -136,21 +166,13 @@ class VLDecode(torch.nn.Module):
 
 vl_decode = VLDecode(model).eval()
 
-llm_onnx = os.path.join(tmpdir, "qwen2p5vl_decode.onnx")
-dummy_ids = inputs["input_ids"]
-dummy_mask = inputs["attention_mask"]
-
-with torch.no_grad():
-    dummy_embeds = vision_to_embeds(
-        dummy_pix,
-        image_grid_thw=dummy_grid if dummy_grid is not None else None,
-        image_sizes=dummy_sizes if dummy_sizes is not None else None,
-    )
+# For export, some runtimes want non-None dummies for optional inputs; supply minimal placeholders if absent
+grid_for_decode  = dummy_grid  if dummy_grid  is not None else torch.tensor([[1, 1, 1]], dtype=torch.long)
+sizes_for_decode = dummy_sizes if dummy_sizes is not None else torch.tensor([[img.height, img.width]], dtype=torch.long)
 
 torch.onnx.export(
     vl_decode,
-    # CHANGED: also thread grid/sizes through decode so KV planning matches, though some builds may not need it
-    (dummy_ids, dummy_mask, dummy_embeds, dummy_grid if dummy_grid is not None else torch.zeros((1,3), dtype=torch.long), dummy_sizes if dummy_sizes is not None else torch.zeros((1,2), dtype=torch.long)),
+    (dummy_ids, dummy_mask, dummy_embeds, grid_for_decode, sizes_for_decode),
     llm_onnx,
     input_names=["input_ids", "attention_mask", "vision_embeds", "image_grid_thw", "image_sizes"],
     output_names=["logits"],
@@ -158,13 +180,13 @@ torch.onnx.export(
     dynamic_axes={
         "input_ids": {0: "batch", 1: "seq"},
         "attention_mask": {0: "batch", 1: "seq"},
-        # vision_embeds can be dynamic over sequence length; omit unless needed by your runtime
+        # vision_embeds is already sequence-like after packing; keep static unless you need it dynamic.
     },
 )
-
 onnx.checker.check_model(onnx.load(llm_onnx))
+print(f"Exported: {llm_onnx}")
 
-# 5) ONNX Runtime with QNN EP (HTP backend/NPU)
+# 8) Create ONNX Runtime sessions (QNN EP on Windows/ARM64 if available; fallback to CPU)
 qnn_provider = (
     "QNNExecutionProvider",
     {
@@ -174,16 +196,25 @@ qnn_provider = (
         "profiling_level": "basic",
     },
 )
-providers = [qnn_provider, "CPUExecutionProvider"]
+providers = []
+try:
+    # QNN EP will only load on Windows/ARM64 with onnxruntime-qnn installed
+    _test = ort.get_available_providers()
+    if "QNNExecutionProvider" in _test:
+        providers = [qnn_provider, "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
+except Exception:
+    providers = ["CPUExecutionProvider"]
 
 sess_vision = ort.InferenceSession(vision_onnx, providers=providers)
 sess_llm = ort.InferenceSession(llm_onnx, providers=providers)
 
-# 6) Run inference
+# 9) Run inference with ORT
 feeds_vision = {"pixel_values": dummy_pix.numpy()}
-if dummy_grid is not None:
+if "image_grid_thw" in inputs:
     feeds_vision["image_grid_thw"] = dummy_grid.numpy()
-if dummy_sizes is not None:
+if "image_sizes" in inputs:
     feeds_vision["image_sizes"] = dummy_sizes.numpy()
 
 vision_out = sess_vision.run(["vision_embeds"], feeds_vision)[0]
@@ -193,11 +224,16 @@ feeds_llm = {
     "attention_mask": dummy_mask.numpy(),
     "vision_embeds": vision_out,
 }
-# keep API symmetry in decode session even if some builds ignore these two:
-if dummy_grid is not None:
-    feeds_llm["image_grid_thw"] = dummy_grid.numpy()
-if dummy_sizes is not None:
-    feeds_llm["image_sizes"] = dummy_sizes.numpy()
+# Keep API symmetry; safe to pass along even if the runtime path ignores them
+feeds_llm["image_grid_thw"] = grid_for_decode.numpy()
+feeds_llm["image_sizes"] = sizes_for_decode.numpy()
 
 logits = sess_llm.run(["logits"], feeds_llm)[0]
 print("Logits shape:", logits.shape)
+
+# 10) Optional: demonstrate a token-vs-grid readout after ORT
+if "image_grid_thw" in inputs and hasattr(model.config, "image_token_id"):
+    T, H, W = inputs["image_grid_thw"][0].tolist()
+    grid_area = T * H * W
+    n_image_tokens = (inputs["input_ids"] == model.config.image_token_id).sum().item()
+    print(f"After ORT: grid_area={grid_area}, image_tokens={n_image_tokens}, pack≈{grid_area / max(1, n_image_tokens):.2f}")
