@@ -1,14 +1,30 @@
-# live_transcribe_dual.py (drop-in)
+# live_transcribe_dual.py 
 # Separate transcriptions for:
 #   - [ME]  = Microphone (your speech)
 #   - [SYS] = System loopback (other people / app audio)
 # Works on Snapdragon PCs: tries local faster-whisper, falls back to OpenAI STT.
 # Ctrl+C to stop. Appends to live_transcript.txt
 
+import glob, re
 import os, io, sys, time, queue, threading, warnings
 import numpy as np
 import soundcard as sc
 import soundfile as sf
+
+_transcribe_thread = None
+
+def start_transcription():
+    global _transcribe_thread
+    if _transcribe_thread and _transcribe_thread.is_alive():
+        print("Transcription already running")
+        return
+    _transcribe_thread = threading.Thread(target=main, daemon=True)
+    _transcribe_thread.start()
+    print("Transcription started")
+
+def stop_transcription():
+    stop_flag.set()
+    print("Stop signal sent")
 
 # Cloud STT
 try:
@@ -61,6 +77,15 @@ microph = sc.default_microphone()
 q_me  = queue.Queue()   # microphone windows
 q_sys = queue.Queue()   # system windows
 stop_flag = threading.Event()
+
+
+def next_transcript_path(prefix="live_transcript", ext=".txt", folder="transcripts"):
+    os.makedirs(folder, exist_ok=True)
+    rx = re.compile(rf"^{re.escape(prefix)}(?:_(\d+))?{re.escape(ext)}$")
+    files = [os.path.basename(p) for p in glob.glob(os.path.join(folder, f"{prefix}*{ext}"))]
+    n = sum(1 for name in files if rx.match(name))
+    return os.path.join(folder, f"{prefix}_{n}{ext}")
+
 
 def downmix_mono(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2 and x.shape[1] > 1:
@@ -242,12 +267,15 @@ def main():
     print("starting capture + dual transcription… press Ctrl+C to stop.")
     cap = threading.Thread(target=capture_loop, daemon=True)
 
+    out_path = next_transcript_path()
+    print(f"writing transcript to: {out_path}")
+
     # Two workers, one per stream
     me_worker  = threading.Thread(target=transcribe_worker,
-                                  args=("[ME]", q_me, HOP_SECONDS, "live_transcript.txt", transcribe_fn),
+                                  args=("[ME]", q_me, HOP_SECONDS, out_path, transcribe_fn),
                                   daemon=True)
     sys_worker = threading.Thread(target=transcribe_worker,
-                                  args=("[SYS]", q_sys, HOP_SECONDS, "live_transcript.txt", transcribe_fn),
+                                  args=("[SYS]", q_sys, HOP_SECONDS, out_path, transcribe_fn),
                                   daemon=True)
 
     cap.start(); me_worker.start(); sys_worker.start()
@@ -261,7 +289,7 @@ def main():
         cap.join(timeout=1.0)
         me_worker.join(timeout=2.0)
         sys_worker.join(timeout=2.0)
-        print("transcript appended to live_transcript.txt")
+        print("transcript appended to", out_path)
 
 if __name__ == "__main__":
     main()
