@@ -25,7 +25,7 @@ ZOOM = 1.0                             # set 2.0 for 2x zoom before tiling
 ANNOTATE = False                        # draw small panel indices
 
 PROMPT = (
-    """"First describe whether the person in the picture shows a positive or negative expression for most of the subimages in the grid. Also indicate whether the person is nodding. You can infer this if you can see that the direction they are looking at is changes up to down or vice versa between each consecutive subimages."""
+    """"First describe whether the person in the picture shows a positive or negative expression for most of the subimages in the grid. Reason through your analysis and output POSITIVE or NEGATIVE in your last sentence."""
 )
 
 # -------------------- helpers on PIL images --------------------
@@ -215,8 +215,14 @@ class AsyncInference:
                     # disjoint batches; for sliding window remove next line
                     self.buffer.clear()
 
+                    # if "positiv" in answer.lower():
+                    #     return True
+                    # else:
+                    #     return False
+
                 except Exception as e:
                     print("[ERROR]", e)
+                
 
     async def report_stats(self, interval_s: float = 1.0):
         last_captured = last_inferred = last_dropped = 0
