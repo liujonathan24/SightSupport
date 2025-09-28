@@ -1,7 +1,16 @@
+# interface.py
+
 import subprocess
 import os
 import glob
 import streamlit as st
+import sys
+import threading
+import queue
+from src.live_transcribe import start_transcription, stop_transcription
+from streamlit_autorefresh import st_autorefresh
+
+__counter = st_autorefresh(interval=2000, key="log_refresher")
 
 # --- Page Config ---
 st.set_page_config(
@@ -15,8 +24,14 @@ st.set_page_config(
 if "processes" not in st.session_state:
     st.session_state.processes = []
 
+if "results" not in st.session_state:
+    st.session_state.results = []
+
+if "out_q" not in st.session_state:
+    st.session_state.out_q = queue.Queue()
+
 # --- Transcript folder ---
-TRANSCRIPTS_FOLDER = "/src/transcripts"  # PUT FULL PATH TO TRANSCRIPTS FOLDER HERE
+TRANSCRIPTS_FOLDER = os.path.abspath("transcripts")  # <-- use absolute path
 os.makedirs(TRANSCRIPTS_FOLDER, exist_ok=True)
 
 # --- Load all transcript files ---
@@ -66,23 +81,107 @@ div.stButton > button {
 </style>
 """, unsafe_allow_html=True)
 
-st.subheader("Run the HUD")  # <-- New title above buttons
+st.subheader("Run the HUD")
 
 # --- Top Buttons ---
 col1, col2 = st.columns([1, 1])
 with col1:
     if st.button("▶️ Run Scripts", key="run"):
-        script_path = os.path.abspath("/src/hud/HUD.py") # PUT FULL PATH TO HUD.PY HERE
-        script1 = subprocess.Popen(["python", script_path])
-        st.session_state.processes.append(script1)
+        script_path = os.path.abspath(
+            "C:/Users/ayush/OneDrive/Documents/Snapdragon/SightSupport/src/video_processing/lms_inference.py"
+        )
+
+        hud_script_path = os.path.abspath(
+            "C:/Users/ayush/OneDrive/Documents/Snapdragon/SightSupport/src/hud.py"
+        )
+        
+        script2 = subprocess.Popen([sys.executable, hud_script_path])
+        st.session_state.processes.append(script2)
         st.success("HUD.py started!")
+
+        print("[spawn] script_path exists:", os.path.exists(script_path))
+        project_root = os.path.abspath("C:/Users/ayush/OneDrive/Documents/Snapdragon/SightSupport")
+        print("[spawn] project_root exists:", os.path.exists(project_root))
+        print("[spawn] launching with cwd:", project_root)
+
+        start_transcription()
+
+        script1 = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            cwd=project_root,  # ensure imports resolve
+        )
+
+        print("[spawn] child pid:", script1.pid)
+        st.session_state.processes.append(script1)
+        st.success("lms_inference.py started!")
+
+        # --- Read child's stdout in background ---
+        def _reader(proc, q):
+            print("[spawn] reader thread started")
+            first_line = False
+            for line in iter(proc.stdout.readline, ""):
+                if not line:
+                    break
+                if not first_line:
+                    # print("[child] first line received")
+                    first_line = True
+                q.put(line.strip())
+                # print("[child] [STDOUT]", line.strip())
+            proc.stdout.close()
+
+        threading.Thread(
+            target=_reader,
+            args=(script1, st.session_state.out_q),
+            daemon=True,
+        ).start()
+
+        # --- Also read stderr for errors ---
+        def _reader_err(proc):
+            for line in iter(proc.stderr.readline, ""):
+                if not line:
+                    break
+                # print("[child] [STDERR]", line.strip())
+            proc.stderr.close()
+
+        threading.Thread(
+            target=_reader_err,
+            args=(script1,),
+            daemon=True,
+        ).start()
+
+        # --- Watch for process exit ---
+        def _watch_exit(proc):
+            rc = proc.wait()
+            print(f"[child] process exited with code {rc}")
+
+        threading.Thread(
+            target=_watch_exit,
+            args=(script1,),
+            daemon=True,
+        ).start()
 
 with col2:
     if st.button("⏹ Stop Scripts", key="stop"):
         for p in st.session_state.processes:
             p.terminate()
+        stop_transcription()
         st.session_state.processes.clear()
-        st.warning("HUD.py stopped.")
+        st.warning("lms_inference.py stopped.")
+
+# --- Drain queue and update results ---
+while not st.session_state.out_q.empty():
+    line = st.session_state.out_q.get_nowait()
+    if "::RESULT::" in line:
+        result = line.split("::RESULT::", 1)[1].strip()
+        sentiment = "positiv" in result.lower().split()[-1]
+        print("[SEN]", sentiment)
+        st.session_state.results.append(result)
+        print("[UI] RESULT CAPTURED:", result)
 
 # --- Sidebar ---
 st.sidebar.title("💬 History")
@@ -96,7 +195,6 @@ current_transcript = st.sidebar.radio(
 st.title("💬 Transcript Console")
 st.subheader(f"Viewing: {current_transcript}")
 
-# Display transcript in a scrollable text area (bounded box)
 st.text_area(
     "Transcript Content",
     value=transcripts[current_transcript],

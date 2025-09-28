@@ -22,7 +22,7 @@ BATCH_SIZE = 16                        # frames per storyboard
 STORY_SIZE = 256                       # 256x256 canvas
 TILE_SIZE = STORY_SIZE // 4            # 64x64 tiles for a 4x4 grid
 ZOOM = 1.0                             # set 2.0 for 2x zoom before tiling
-ANNOTATE = False                        # draw small panel indices
+ANNOTATE = False                       # draw small panel indices
 
 PROMPT = (
     """"First describe whether the person in the picture shows a positive or negative expression for most of the subimages in the grid. Reason through your analysis and output POSITIVE or NEGATIVE in your last sentence."""
@@ -210,19 +210,18 @@ class AsyncInference:
                     self.stats.infer_ms_ewma = Stats.ewma(self.stats.infer_ms_ewma, infer_ms)
                     self.stats.lag_ms_ewma   = Stats.ewma(self.stats.lag_ms_ewma,   lag_ms)
 
-                    print("[RESULT]", answer)
+                    # ---- The only line you need for the UI handoff ----
+                    print("::RESULT:: " + answer, flush=True)
+                    # ----------------------------------------------------
+
+                    # optional human-readable log
+                    print("[RESULT]", answer, flush=True)
 
                     # disjoint batches; for sliding window remove next line
                     self.buffer.clear()
 
-                    # if "positiv" in answer.lower():
-                    #     return True
-                    # else:
-                    #     return False
-
                 except Exception as e:
-                    print("[ERROR]", e)
-                
+                    print("[ERROR]", e, flush=True)
 
     async def report_stats(self, interval_s: float = 1.0):
         last_captured = last_inferred = last_dropped = 0
@@ -233,26 +232,28 @@ class AsyncInference:
             last_captured, last_inferred, last_dropped = c, i, d
 
             q = self.queue.qsize()
-            if self.stats.infer_ms_ewma is not None:
-                print(
-                    f"[STATS] q={q} (max {self.stats.max_q}) | "
-                    f"cap {dc}/s, infer {di}/s, drops {dd}/s | "
-                    f"EWMA infer={self.stats.infer_ms_ewma:.0f} ms, "
-                    f"EWMA lag={self.stats.lag_ms_ewma:.0f} ms"
-                )
-            else:
-                print(
-                    f"[STATS] q={q} (max {self.stats.max_q}) | "
-                    f"cap {dc}/s, infer {di}/s, drops {dd}/s"
-                )
+            # if self.stats.infer_ms_ewma is not None:
+            #     print(
+            #         f"[STATS] q={q} (max {self.stats.max_q}) | "
+            #         f"cap {dc}/s, infer {di}/s, drops {dd}/s | "
+            #         f"EWMA infer={self.stats.infer_ms_ewma:.0f} ms, "
+            #         f"EWMA lag={self.stats.lag_ms_ewma:.0f} ms",
+            #         flush=True
+            #     )
+            # else:
+            #     print(
+            #         f"[STATS] q={q} (max {self.stats.max_q}) | "
+            #         f"cap {dc}/s, infer {di}/s, drops {dd}/s",
+            #         flush=True
+            #     )
 
             # simple warnings
-            if self.queue.maxsize and q > 0.8 * self.queue.maxsize:
-                print("[WARN] Queue near capacity — inference is not keeping up.")
-            if dd > 0:
-                print(f"[WARN] Dropping frames ({dd}/s). Consider slower capture or smaller images.")
-            if self.stats.lag_ms_ewma and self.stats.lag_ms_ewma > 1500:
-                print("[WARN] High end-to-end lag (>1.5s).")
+            # if self.queue.maxsize and q > 0.8 * self.queue.maxsize:
+            #     print("[WARN] Queue near capacity — inference is not keeping up.", flush=True)
+            # if dd > 0:
+            #     print(f"[WARN] Dropping frames ({dd}/s). Consider slower capture or smaller images.", flush=True)
+            # if self.stats.lag_ms_ewma and self.stats.lag_ms_ewma > 1500:
+            #     print("[WARN] High end-to-end lag (>1.5s).", flush=True)
 
     async def run(self):
         producer = asyncio.create_task(self.capture_frames(period_s=CAPTURE_PERIOD_S))
@@ -262,7 +263,13 @@ class AsyncInference:
 
 # -------------------- entry point --------------------
 if __name__ == "__main__":
+    import traceback, sys
+    print("::READY:: lms_inference booted", flush=True)
     try:
         asyncio.run(AsyncInference(app="Zoom").run())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("::EXIT:: keyboard interrupt", flush=True)
+    except Exception as e:
+        print("[FATAL] Unhandled exception:", repr(e), flush=True)
+        traceback.print_exc()
+        sys.exit(1)
