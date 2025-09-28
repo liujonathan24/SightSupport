@@ -1,34 +1,51 @@
-import asyncio, base64
+import asyncio
+import base64
+import time
+import statistics as _stats
+from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
-from typing import Deque, List, Sequence
+from typing import Deque, List, Sequence, Optional
+
 from PIL import Image, ImageDraw, ImageFont
 from openai import AsyncOpenAI
 from src.video_processing.meeting_window import Window
 
-# ---------- helpers on PIL images ----------
-def center_crop_square(img: Image.Image, zoom: float = 1) -> Image.Image:
+# -------------------- config --------------------
+MODEL_ID = "Qwen2.5-VL-7B-Instruct"    # update to exact id from /v1/models if needed
+BASE_URL = "http://localhost:1234/v1"  # LM Studio OpenAI-compatible server
+API_KEY  = "lm-studio"                 # any non-empty string
+
+CAPTURE_PERIOD_S = 0.5                # 500 ms capture cadence
+QUEUE_MAXSIZE = 64                     # producer backpressure
+BATCH_SIZE = 16                        # frames per storyboard
+STORY_SIZE = 256                       # 256x256 canvas
+TILE_SIZE = STORY_SIZE // 4            # 64x64 tiles for a 4x4 grid
+ZOOM = 1.0                             # set 2.0 for 2x zoom before tiling
+ANNOTATE = False                        # draw small panel indices
+
+PROMPT = (
+    """"First describe whether the person in the picture shows a positive or negative expression for most of the subimages in the grid. Also indicate whether the person is nodding. You can infer this if you can see that the direction they are looking at is changes up to down or vice versa between each consecutive subimages."""
+)
+
+# -------------------- helpers on PIL images --------------------
+def center_crop_square(img: Image.Image, zoom: float = 1.0) -> Image.Image:
     """
     Center-crop to a square. If zoom > 1, zooms in by cropping a smaller
     centered square (side/zoom) and resizing back to the original square size.
-
-    Example: zoom=2.0 -> 2x zoom.
     """
     w, h = img.size
     side = min(w, h)
 
-    # 1) center-crop to the largest square
     left = (w - side) // 2
     top  = (h - side) // 2
     sq = img.crop((left, top, left + side, top + side))
 
-    # 2) optional zoom-in: crop a smaller centered square and upscale back
     if zoom and zoom > 1.0:
         inner = max(1, int(round(side / zoom)))
         cx = side // 2
         cy = side // 2
         half = inner // 2
-        # clamp to bounds just in case of odd sizes
         x0 = max(0, cx - half)
         y0 = max(0, cy - half)
         x1 = min(side, x0 + inner)
@@ -37,34 +54,57 @@ def center_crop_square(img: Image.Image, zoom: float = 1) -> Image.Image:
 
     return sq
 
-
 def pick_16_evenly(images: Sequence[Image.Image]) -> List[Image.Image]:
     if not images:
         raise ValueError("No images provided")
     n = len(images)
-    if n == 16: return list(images)
-    if n < 16:  return list(images) + [images[-1]] * (16 - n)
+    if n == 16:
+        return list(images)
+    if n < 16:
+        return list(images) + [images[-1]] * (16 - n)
     idxs = [round(i * (n - 1) / 15) for i in range(16)]
     return [images[i] for i in idxs]
 
-def make_storyboard_16(images: Sequence[Image.Image], out_path="story_256.png", annotate=True) -> str:
+def make_storyboard_16(
+    images: Sequence[Image.Image],
+    out_path: str = "story_256.png",
+    annotate: bool = True,
+    tile_size: int = TILE_SIZE,
+    cols_rows: int = 4,
+    zoom: float = ZOOM,
+) -> str:
+    """
+    Build a cols_rows x cols_rows grid (default 4x4) from 16 frames into a STORY_SIZE PNG.
+    Accepts a list of PIL Images directly.
+    """
     imgs16 = pick_16_evenly(images)
-    TILE = 64; COLS = ROWS = 4
-    board = Image.new("RGB", (COLS*TILE, ROWS*TILE), (245,245,245))
-    draw = ImageDraw.Draw(board); 
-    try: font = ImageFont.load_default()
-    except Exception: font = None
+
+    board = Image.new("RGB", (cols_rows * tile_size, cols_rows * tile_size), (245, 245, 245))
+    draw = ImageDraw.Draw(board)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
     for i, img in enumerate(imgs16):
-        if img.mode not in ("RGB","RGBA"): img = img.convert("RGB")
-        img = center_crop_square(img).resize((TILE, TILE), Image.LANCZOS)
-        r, c = divmod(i, COLS); x, y = c*TILE, r*TILE
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        img = center_crop_square(img, zoom=zoom).resize((tile_size, tile_size), Image.LANCZOS)
+
+        r, c = divmod(i, cols_rows)
+        x, y = c * tile_size, r * tile_size
         board.paste(img, (x, y))
+
         if annotate:
             lab = str(i)
-            try: tw, th = (lambda b: (b[2]-b[0], b[3]-b[1]))(draw.textbbox((0,0), lab, font=font))
-            except Exception: tw, th = draw.textsize(lab, font=font)
-            draw.rectangle([x+4, y+4, x+4+tw+6, y+4+th+6], fill=(0,0,0))
-            draw.text((x+7, y+7), lab, fill=(255,255,255), font=font)
+            try:
+                bbox = draw.textbbox((0, 0), lab, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            except Exception:
+                tw, th = draw.textsize(lab, font=font)
+            draw.rectangle([x + 4, y + 4, x + 4 + tw + 6, y + 4 + th + 6], fill=(0, 0, 0))
+            draw.text((x + 7, y + 7), lab, fill=(255, 255, 255), font=font)
+
     board.save(out_path)
     return out_path
 
@@ -73,44 +113,80 @@ def to_data_url(fp: str) -> str:
     b64 = base64.b64encode(Path(fp).read_bytes()).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-# ---------- async pipeline ----------
-class AsyncInference:
-    def __init__(self, app="Zoom", model="Qwen2.5-VL-7B-Instruct", q_maxsize=64):
-        self.window = Window(app)
-        self.queue: asyncio.Queue[Image.Image] = asyncio.Queue(maxsize=q_maxsize)
-        self.buffer: Deque[Image.Image] = deque(maxlen=64)  # rolling store; ≥16 for a batch
-        self.client = AsyncOpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
-        self.model = model
+# -------------------- telemetry wrappers --------------------
+@dataclass
+class Frame:
+    img: Image.Image
+    t_capture: float  # seconds since epoch
 
-    async def capture_frames(self, period_s=0.1):
-        """Producer: capture every ~100 ms without blocking."""
+class Stats:
+    def __init__(self):
+        self.captured = 0
+        self.dropped = 0
+        self.inferred = 0
+        self.max_q = 0
+        self.infer_ms_ewma: Optional[float] = None
+        self.lag_ms_ewma: Optional[float] = None
+
+    @staticmethod
+    def ewma(old: Optional[float], new: float, alpha: float = 0.2) -> float:
+        return new if old is None else (alpha * new + (1.0 - alpha) * old)
+
+# -------------------- async pipeline --------------------
+class AsyncInference:
+    def __init__(self, app: str = "Zoom", model: str = MODEL_ID, q_maxsize: int = QUEUE_MAXSIZE):
+        self.window = Window(app)
+        self.queue: asyncio.Queue[Frame] = asyncio.Queue(maxsize=q_maxsize)
+        self.buffer: Deque[Frame] = deque(maxlen=64)  # rolling store
+        self.client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
+        self.model = model
+        self.stats = Stats()
+
+    async def capture_frames(self, period_s: float = CAPTURE_PERIOD_S):
+        """Producer: capture every ~period_s without blocking."""
         while True:
-            # Window.get_image() is sync -> offload to thread to avoid blocking event loop
             img = await asyncio.to_thread(self.window.get_image)
             if isinstance(img, Image.Image):
+                f = Frame(img=img, t_capture=time.time())
                 try:
-                    self.queue.put_nowait(img)
+                    self.queue.put_nowait(f)
+                    self.stats.captured += 1
+                    self.stats.max_q = max(self.stats.max_q, self.queue.qsize())
                 except asyncio.QueueFull:
-                    # Drop oldest by pulling one and pushing the latest (keeps recency)
-                    _ = self.queue.get_nowait()
-                    self.queue.task_done()
-                    await self.queue.put(img)
+                    # drop oldest to keep recency
+                    try:
+                        _ = self.queue.get_nowait()
+                        self.queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    self.stats.dropped += 1
+                    await self.queue.put(f)
             await asyncio.sleep(period_s)
 
-    async def analyze_batches(self, prompt=(
-        "Across the panels in chronological order, is the person shaking their head? Respond only True or False."
-    )):
-        """Consumer: build 16-frame storyboard whenever ≥16 frames are available, send async request."""
+    async def analyze_batches(self, prompt: str = PROMPT):
+        """Consumer: when ≥16 frames available, build storyboard, call model, print result."""
         while True:
-            img = await self.queue.get()
-            self.buffer.append(img)
+            f = await self.queue.get()
+            self.buffer.append(f)
             self.queue.task_done()
 
-            if len(self.buffer) >= 16:
-                # Take the last 16 frames (or evenly sample more)
-                frames = list(self.buffer)
-                story = make_storyboard_16(frames, out_path="story_256.png", annotate=True)
+            if len(self.buffer) >= BATCH_SIZE:
+                # take the most recent BATCH_SIZE frames (deque has no slicing -> convert to list)
+                recent = list(self.buffer)[-BATCH_SIZE:]
+                frames = [x.img for x in recent]
+
+                story = make_storyboard_16(
+                    frames,
+                    out_path="story_256.png",
+                    annotate=ANNOTATE,
+                    tile_size=TILE_SIZE,
+                    cols_rows=4,
+                    zoom=ZOOM,
+                )
                 img_url = to_data_url(story)
+
+                t0 = time.time()
+                t_cap_avg = _stats.fmean(x.t_capture for x in recent)
 
                 try:
                     resp = await self.client.chat.completions.create(
@@ -124,18 +200,61 @@ class AsyncInference:
                         }],
                         temperature=0.1,
                     )
-                    print("[RESULT]", resp.choices[0].message.content.strip())
-                    # Optional: clear buffer to make strictly non-overlapping windows
+                    answer = resp.choices[0].message.content.strip()
+                    t1 = time.time()
+
+                    infer_ms = (t1 - t0) * 1000.0
+                    lag_ms   = (t1 - t_cap_avg) * 1000.0
+
+                    self.stats.inferred += 1
+                    self.stats.infer_ms_ewma = Stats.ewma(self.stats.infer_ms_ewma, infer_ms)
+                    self.stats.lag_ms_ewma   = Stats.ewma(self.stats.lag_ms_ewma,   lag_ms)
+
+                    print("[RESULT]", answer)
+
+                    # disjoint batches; for sliding window remove next line
                     self.buffer.clear()
+
                 except Exception as e:
                     print("[ERROR]", e)
 
-    async def run(self):
-        producer = asyncio.create_task(self.capture_frames(period_s=0.05))
-        consumer = asyncio.create_task(self.analyze_batches())
-        await asyncio.gather(producer, consumer)
+    async def report_stats(self, interval_s: float = 1.0):
+        last_captured = last_inferred = last_dropped = 0
+        while True:
+            await asyncio.sleep(interval_s)
+            c, i, d = self.stats.captured, self.stats.inferred, self.stats.dropped
+            dc, di, dd = c - last_captured, i - last_inferred, d - last_dropped
+            last_captured, last_inferred, last_dropped = c, i, d
 
-# ---------- entry point ----------
+            q = self.queue.qsize()
+            if self.stats.infer_ms_ewma is not None:
+                print(
+                    f"[STATS] q={q} (max {self.stats.max_q}) | "
+                    f"cap {dc}/s, infer {di}/s, drops {dd}/s | "
+                    f"EWMA infer={self.stats.infer_ms_ewma:.0f} ms, "
+                    f"EWMA lag={self.stats.lag_ms_ewma:.0f} ms"
+                )
+            else:
+                print(
+                    f"[STATS] q={q} (max {self.stats.max_q}) | "
+                    f"cap {dc}/s, infer {di}/s, drops {dd}/s"
+                )
+
+            # simple warnings
+            if self.queue.maxsize and q > 0.8 * self.queue.maxsize:
+                print("[WARN] Queue near capacity — inference is not keeping up.")
+            if dd > 0:
+                print(f"[WARN] Dropping frames ({dd}/s). Consider slower capture or smaller images.")
+            if self.stats.lag_ms_ewma and self.stats.lag_ms_ewma > 1500:
+                print("[WARN] High end-to-end lag (>1.5s).")
+
+    async def run(self):
+        producer = asyncio.create_task(self.capture_frames(period_s=CAPTURE_PERIOD_S))
+        consumer = asyncio.create_task(self.analyze_batches(prompt=PROMPT))
+        reporter = asyncio.create_task(self.report_stats(interval_s=1.0))
+        await asyncio.gather(producer, consumer, reporter)
+
+# -------------------- entry point --------------------
 if __name__ == "__main__":
     try:
         asyncio.run(AsyncInference(app="Zoom").run())
