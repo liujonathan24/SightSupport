@@ -1,14 +1,51 @@
-import sys
+import sys, os, re, glob
 import keyboard
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QCheckBox, QVBoxLayout, QFrame, QRadioButton,
     QButtonGroup, QTextEdit, QShortcut
 )
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QRect
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QObject, pyqtSignal, QThread
 from PyQt5.QtGui import QFont, QKeySequence
+
+# RAG client
+from src.RAG_assistant import TextContextClient
 
 
 class HUD(QWidget):
+    # Worker used to stream RAG tokens back to the UI safely
+    class RAGWorker(QObject):
+        chunk = pyqtSignal(str)
+        done = pyqtSignal()
+        error = pyqtSignal(str)
+
+        def __init__(self, client: TextContextClient, prompt: str, context_text: str = "", temperature: float = 0.2):
+            super().__init__()
+            self.client = client
+            self.prompt = prompt
+            self.context_text = context_text
+            self.temperature = temperature
+            self._stop = False
+
+        def stop(self):
+            self._stop = True
+
+        def run(self):
+            try:
+                if self.context_text is not None:
+                    self.client.set_context(self.context_text)
+                for piece in self.client.stream(
+                    user_text=self.prompt,
+                    context_text=None,
+                    temperature=self.temperature,
+                ):
+                    if self._stop:
+                        break
+                    if piece:
+                        self.chunk.emit(piece)
+                self.done.emit()
+            except Exception as e:
+                self.error.emit(str(e))
+
     def __init__(self):
         super().__init__()
 
@@ -31,22 +68,31 @@ class HUD(QWidget):
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
 
-        # --- Input/output boxes ---
+        # --- Input box ---
         self.input_box = QTextEdit(self)
         self.input_box.setPlaceholderText("Type your question here... (press Ctrl+Enter to send)")
         self.input_box.setFont(QFont(self.base_font.family(), 15))
         self.input_box.setFixedHeight(60)
         self.input_box.textChanged.connect(self.auto_resize_input)
 
-        # Ctrl+Enter submits the question
         QShortcut(QKeySequence("Ctrl+Return"), self.input_box, activated=self.store_question)
         QShortcut(QKeySequence("Ctrl+Enter"), self.input_box, activated=self.store_question)
 
+        # --- Answer box (kept but hidden to avoid layout changes elsewhere) ---
+        self.answer_box = QTextEdit(self)
+        self.answer_box.setReadOnly(True)
+        self.answer_box.setFont(QFont(self.base_font.family(), 14))
+        self.answer_box.setFixedHeight(0)      # collapse
+        self.answer_box.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.answer_box.hide()                  # hide so only bottom output shows answers
+
+        # --- History log ---
         self.output_box = QTextEdit(self)
         self.output_box.setReadOnly(True)
-        self.output_box.setFont(QFont(self.base_font.family(), 14))
-        self.output_box.setFixedHeight(140)
+        self.output_box.setFont(QFont(self.base_font.family(), 13))
+        self.output_box.setFixedHeight(100)
         self.output_box.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Auto-resize the Q/A box to fit full content
         self.output_box.textChanged.connect(self.auto_resize_output)
 
         # --- Styles ---
@@ -141,6 +187,12 @@ class HUD(QWidget):
         keyboard.add_hotkey("alt+z", lambda: QTimer.singleShot(0, self.toggle_settings))
         keyboard.add_hotkey("alt+b", lambda: QTimer.singleShot(0, self.terminate_hud))
 
+        # --- RAG wiring ---
+        self.rag_client = TextContextClient()
+        self._context_text = "Default context here."
+        self._rag_thread = None
+        self._rag_worker = None
+
         # --- Apply theme ---
         self.apply_theme()
 
@@ -148,20 +200,21 @@ class HUD(QWidget):
         self.show_alt_x()
         self.show()
 
-    # --- Auto-resize input/output ---
+    # --- Auto-resize input ---
     def auto_resize_input(self):
         doc_height = self.input_box.document().size().height()
         new_h = int(doc_height) + 26
-        max_input_h = 300
-        new_h = max(48, min(max_input_h, new_h))
+        new_h = max(48, min(300, new_h))
         if new_h != self.input_box.height():
             self.input_box.setFixedHeight(new_h)
             self.reposition_boxes()
 
+    # --- Auto-resize output (Q/A history) ---
     def auto_resize_output(self):
         doc_height = self.output_box.document().size().height()
         new_h = int(doc_height) + 26
-        max_output_h = 400
+        # Grow to fit entire content; keep a generous cap to avoid runaway window growth
+        max_output_h = 1200
         new_h = max(80, min(max_output_h, new_h))
         if new_h != self.output_box.height():
             self.output_box.setFixedHeight(new_h)
@@ -222,6 +275,7 @@ class HUD(QWidget):
 
         input_style = f"border-radius: 10px; padding: 8px; background-color: {input_bg}; color: {input_fg};"
         self.input_box.setStyleSheet(input_style)
+        self.answer_box.setStyleSheet(input_style)
         self.output_box.setStyleSheet(input_style)
 
     # --- Settings updates ---
@@ -236,6 +290,7 @@ class HUD(QWidget):
     # --- Hotkey functions ---
     def show_alt_d(self):
         self.input_box.hide()
+        self.answer_box.hide()
         self.output_box.hide()
         if self.settings_frame.height() > 0:
             self.animate_settings(False)
@@ -246,16 +301,18 @@ class HUD(QWidget):
             self.animate_settings(False)
         self.show_message("What would you like to ask me?")
         self.input_box.show()
+        # self.answer_box.show()  # keep hidden to remove the top output
         self.output_box.show()
         self.input_box.raise_()
+        # self.answer_box.raise_()
         self.output_box.raise_()
         self.input_box.setFocus()
         self.auto_resize_input()
-        self.auto_resize_output()
         self.reposition_boxes()
 
     def toggle_settings(self):
         self.input_box.hide()
+        self.answer_box.hide()
         self.output_box.hide()
         if self.settings_frame.height() == 0:
             self.compute_settings_height()
@@ -290,17 +347,21 @@ class HUD(QWidget):
         if message != "Settings":
             self.last_message = message
 
-    # --- Reposition input/output boxes ---
+    # --- Reposition boxes ---
     def reposition_boxes(self):
         label_height = self.label.height() + 36
         input_height = self.input_box.height()
+        answer_height = self.answer_box.height()  # 0 because hidden/collapsed
         output_height = self.output_box.height()
-        gap = 12
+        gap = 10
         left = 20
         width = self.default_width - (left * 2)
+
         self.input_box.setGeometry(left, label_height, width, input_height)
-        self.output_box.setGeometry(left, label_height + input_height + gap, width, output_height)
-        needed_height = label_height + input_height + gap + output_height + 20
+        self.answer_box.setGeometry(left, label_height + input_height + gap, width, answer_height)
+        self.output_box.setGeometry(left, label_height + input_height + answer_height + 2*gap, width, output_height)
+
+        needed_height = label_height + input_height + answer_height + output_height + 3*gap + 20
         self.setGeometry(100, 100, self.default_width, max(self.default_height, needed_height))
 
     # --- Store user question ---
@@ -308,14 +369,106 @@ class HUD(QWidget):
         question = self.input_box.toPlainText().strip()
         if question:
             self.questions.append(question)
-            self.output_box.append(f"Q: {question}")
-            self.input_box.clear()
+            # Log Q:
+            self.output_box.append(f'Q: {question}')
+            # Prepare the A: line and stream into it
+            self.output_box.append('A: ')
             self.auto_resize_output()
-            self.auto_resize_input()
+            self.input_box.clear()
+            self.ask_rag(question)
 
     # --- Terminate ---
     def terminate_hud(self):
         QApplication.quit()
+
+    # --- RAG helper ---
+    def ask_rag(self, user_prompt: str):
+        self.load_context_file()
+        if self._rag_thread is not None:
+            try:
+                if self._rag_worker:
+                    self._rag_worker.stop()
+            except Exception:
+                pass
+
+        # (answer_box kept but unused)
+        self.answer_box.clear()
+
+        self._rag_thread = QThread()
+        self._rag_worker = HUD.RAGWorker(
+            client=self.rag_client,
+            prompt=user_prompt,
+            context_text=self._context_text,
+            temperature=0.2,
+        )
+        self._rag_worker.moveToThread(self._rag_thread)
+        self._rag_thread.started.connect(self._rag_worker.run)
+        self._rag_worker.chunk.connect(self._on_rag_chunk)
+        self._rag_worker.done.connect(self._on_rag_done)
+        self._rag_worker.error.connect(self._on_rag_error)
+        self._rag_worker.done.connect(self._rag_thread.quit)
+        self._rag_worker.error.connect(self._rag_thread.quit)
+        self._rag_thread.finished.connect(self._cleanup_rag_thread)
+        self._rag_thread.start()
+
+    def _on_rag_chunk(self, piece: str):
+        # Stream directly into bottom output after the 'A: ' prefix
+        cursor = self.output_box.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.insertText(piece)
+        self.output_box.setTextCursor(cursor)
+        self.auto_resize_output()
+
+    def _on_rag_done(self):
+        # Just move to a new line; don't duplicate the answer
+        self.output_box.append("")
+        self.auto_resize_output()
+
+    def _on_rag_error(self, msg: str):
+        self.output_box.append(f"\n[Error] {msg}")
+        self.auto_resize_output()
+
+    def _cleanup_rag_thread(self):
+        try:
+            if self._rag_worker:
+                self._rag_worker.deleteLater()
+        except Exception:
+            pass
+        self._rag_worker = None
+        try:
+            if self._rag_thread:
+                self._rag_thread.deleteLater()
+        except Exception:
+            pass
+        self._rag_thread = None
+
+    def load_context_file(self):
+        path = self.curr_transcript_path()
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._context_text = f.read()
+        except Exception as e:
+            self.output_box.append(f"[Context load error] {e}")
+
+        print("YAYAYYAYA", self._context_text)
+
+    def curr_transcript_path(self, prefix="live_transcript", ext=".txt", folder="transcripts"):
+        os.makedirs(folder, exist_ok=True)
+        # Match live_transcript.txt or live_transcript_<n>.txt
+        rx = re.compile(rf"^{re.escape(prefix)}(?:_(\d+))?{re.escape(ext)}$")
+        max_n = -1
+        for p in glob.glob(os.path.join(folder, f"{prefix}*{ext}")):
+            name = os.path.basename(p)
+            m = rx.match(name)
+            if not m:
+                continue
+            if m.group(1) is None:
+                max_n = max(max_n, 0)
+            else:
+                max_n = max(max_n, int(m.group(1)))
+        next_n = (max_n + 1) if max_n >= 0 else 0
+        return os.path.join(folder, f"{prefix}_{next_n - 1}{ext}")
 
 
 if __name__ == "__main__":
