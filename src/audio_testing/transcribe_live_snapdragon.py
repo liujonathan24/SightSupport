@@ -3,7 +3,7 @@
 #   - [ME]  = Microphone (your speech)
 #   - [SYS] = System loopback (other people / app audio)
 # Works on Snapdragon PCs: tries local faster-whisper, falls back to OpenAI STT.
-# Ctrl+C to stop. Appends to live_transcript.txt
+# Appends to live_transcript_{n}.txt
 
 import glob, re
 import os, io, sys, time, queue, threading, warnings
