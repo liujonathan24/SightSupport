@@ -108,6 +108,35 @@ div.stButton > button {
 </style>
 """, unsafe_allow_html=True)
 
+
+st.markdown("""
+<style>
+:root{
+  --asst-bg: var(--secondary-background-color, #f0f2f6);
+  --asst-fg: var(--text-color, #0e1117);
+  --asst-border: rgba(49,51,63,0.2);
+    --asst-defj: var(--secondary-background-color, #262730);
+}
+div.assistant-title{
+  font-weight:600;
+  margin-bottom:6px;
+}
+div.assistant-box{
+  height:280px;
+  overflow:auto;
+  padding:10px;
+  border:1px solid var(--asst-fg) !important;
+  border-radius:8px;
+  background: var(--asst-defj) !important;   /* force gray background */
+  color: var(--asst-bg) !important;         /* force readable text */
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  line-height:1.4;
+  white-space: pre-wrap;    /* preserves newlines */
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 st.subheader("Run the HUD")
 
 # --- Top Buttons ---
@@ -254,23 +283,33 @@ with left:
         disabled=True
     )
 
-    
 with right:
-    # Assistant history (static, but wrapped in a placeholder so we can update live)
-    if "assistant_placeholder" not in st.session_state:
-        st.session_state.assistant_placeholder = st.empty()
+    # Local placeholder created each run at a fixed position
+    assistant_ph = st.empty()
 
-    # Render current history before streaming
-    assistant_text = "\n\n".join(st.session_state.results) if st.session_state.results else ""
-    st.session_state.assistant_placeholder.text_area(
-        "Assistant",
-        value=assistant_text,
-        height=280,
-        key="assistant_history",
-        disabled=True
-    )
+    # Build text for this run:
+    history_text = "\n\n".join(st.session_state.results) if st.session_state.results else ""
+    # Use .get(...) so we never crash if state was cleared somehow
+    live_buf = st.session_state.get("assistant_live", "")
+    assistant_source = live_buf if live_buf else history_text
 
-    # Prompt input
+    def _render_assistant_box(text: str, streaming: bool = False):
+        # Basic escape only; rely on CSS pre-wrap for newlines
+        safe = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        title = "Assistant (streaming…)" if streaming else "Assistant"
+        assistant_ph.markdown(
+            f"""
+            <div class="assistant-title">{title}</div>
+            <div class="assistant-box">{safe if safe.strip() else "&nbsp;"}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+    # Paint assistant box for this run (shows live buffer if streaming, else history)
+    _render_assistant_box(assistant_source, streaming=bool(live_buf))
+
+    # Prompt input (normal widget so it stays put)
     st.text_area(
         "Your question to the assistant",
         value=st.session_state.user_prompt,
@@ -283,40 +322,35 @@ with right:
     if st.button("Ask", key="ask_stream"):
         if not st.session_state.is_streaming and st.session_state.user_prompt.strip():
             st.session_state.is_streaming = True
-            acc = ""
+            st.session_state.assistant_live = ""   # reset live buffer
             try:
                 import time
+                prefix = history_text + ("\n\n" if history_text and not history_text.endswith("\n\n") else "")
+
+                acc = ""
                 for tok in st.session_state.text_client.stream(
                     user_text=st.session_state.user_prompt,
                     context_text=transcripts[current_transcript],
                     temperature=0.2,
                 ):
                     acc += tok
-                    # Update the assistant box directly
-                    st.session_state.assistant_placeholder.text_area(
-                        "Assistant (streaming…)",
-                        value=acc,
-                        height=280,
-                        key="assistant_stream",
-                        disabled=True
-                    )
+                    st.session_state.assistant_live = prefix + acc
+                    _render_assistant_box(st.session_state.assistant_live, streaming=True)
                     time.sleep(0.01)
-                # Persist final result into history and render final state
+
+                # Commit final to history
                 if acc.strip():
                     st.session_state.results.append(acc)
-                    st.session_state.assistant_placeholder.text_area(
-                        "Assistant",
-                        value="\n\n".join(st.session_state.results),
-                        height=280,
-                        key="assistant_history_final",
-                        disabled=True
-                    )
+
+                # Clear live buffer; next rerun will render from history
+                st.session_state.assistant_live = ""
+                _render_assistant_box("\n\n".join(st.session_state.results), streaming=False)
+
             except Exception as e:
-                st.session_state.assistant_placeholder.error(str(e))
+                st.session_state.assistant_live = ""
+                _render_assistant_box(f"{history_text}\n\n[Error]\n{e}", streaming=False)
             finally:
                 st.session_state.is_streaming = False
-
-
 
 
 
