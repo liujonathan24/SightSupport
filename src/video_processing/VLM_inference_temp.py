@@ -17,13 +17,15 @@ from qwen_vl_utils import process_vision_info
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # 1) Load model + processor
-# - torch_dtype: float32 is safest on CPU; use bfloat16/float16 only if you know your hardware supports it end-to-end.
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float32,
+    dtype=torch.float32,
     device_map="cpu",
+    trust_remote_code=True
 ).eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+print([n for n, _ in model.named_modules()][:200])
 
 # 2) Prepare inputs (messages -> processor -> tensors)
 text = "Describe this image."
@@ -74,6 +76,10 @@ if "image_grid_thw" in inputs:
 
 # Accessors for the visual tower and projector; trust_remote_code models provide helpers.
 def get_vision_tower(m):
+    try:
+        return getattr(model.model, "visual", None)
+    except:
+        print(":(")
     if hasattr(m, "get_vision_tower"):
         return m.get_vision_tower()
     if hasattr(m, "vision_tower"):
@@ -81,6 +87,10 @@ def get_vision_tower(m):
     raise RuntimeError("Vision tower accessor not found on model.")
 
 def get_vision_projector(m):
+    try:
+        return getattr(model.model, "projector", None)
+    except:
+        print(":(")
     if hasattr(m, "get_vision_projector"):
         return m.get_vision_projector()
     if hasattr(m, "vision_proj") or hasattr(m, "multi_modal_projector"):
