@@ -1,9 +1,9 @@
-# live_transcribe.py 
+# live_transcribe.py
 # Separate transcriptions for:
 #   - [ME]  = Microphone (your speech)
 #   - [SYS] = System loopback (other people / app audio)
 # Works on Snapdragon PCs: tries local faster-whisper, falls back to OpenAI STT.
-# Appends to live_transcript_{n}.txt
+# Appends to transcripts/live_transcript_{n}.txt
 
 import glob, re
 import os, io, sys, time, queue, threading, warnings
@@ -35,15 +35,15 @@ HOP_SECONDS = 3.0
 
 # Cross-talk gating (simple energy-based)
 # If ME energy >> SYS, suppress SYS; if SYS >> ME, suppress ME
-GATE_RATIO_DB = 12.0         # slightly less eager to gate; preserves vocals under music
-FLOOR = 1e-8                 # numeric floor to avoid log issues
+GATE_RATIO_DB = 12.0
+FLOOR = 1e-8
 
 # Optional base gains (usually keep both 1.0 since we transcribe separately)
 ME_GAIN  = 1.0
 SYS_GAIN = 1.0
 
 # Local model (if available)
-LOCAL_MODEL_NAME = "small.en"     # a touch better than base.en for lyrics
+LOCAL_MODEL_NAME = "small.en"
 LOCAL_DEVICE = "cpu"
 LOCAL_COMPUTE_TYPE = "int8"
 
@@ -61,16 +61,28 @@ microph = sc.default_microphone()
 # Queues for windows of each stream
 q_me  = queue.Queue()   # microphone windows
 q_sys = queue.Queue()   # system windows
-stop_flag = threading.Event()
 
+# Control + I/O synchronization
+stop_flag = threading.Event()
+file_lock = threading.Lock()  # serialize writes across workers
 
 def next_transcript_path(prefix="live_transcript", ext=".txt", folder="transcripts"):
     os.makedirs(folder, exist_ok=True)
+    # Match live_transcript.txt or live_transcript_<n>.txt
     rx = re.compile(rf"^{re.escape(prefix)}(?:_(\d+))?{re.escape(ext)}$")
-    files = [os.path.basename(p) for p in glob.glob(os.path.join(folder, f"{prefix}*{ext}"))]
-    n = sum(1 for name in files if rx.match(name))
-    return os.path.join(folder, f"{prefix}_{n}{ext}")
-
+    max_n = -1
+    for p in glob.glob(os.path.join(folder, f"{prefix}*{ext}")):
+        name = os.path.basename(p)
+        m = rx.match(name)
+        if not m:
+            continue
+        if m.group(1) is None:
+            # Bare file (live_transcript.txt) counts as index 0
+            max_n = max(max_n, 0)
+        else:
+            max_n = max(max_n, int(m.group(1)))
+    next_n = (max_n + 1) if max_n >= 0 else 0
+    return os.path.join(folder, f"{prefix}_{next_n}{ext}")
 
 def downmix_mono(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2 and x.shape[1] > 1:
@@ -89,7 +101,7 @@ def normalize_rms(x: np.ndarray, target_db: float = -20.0, floor: float = 1e-9) 
     rms = np.sqrt(np.mean(np.square(x), dtype=np.float32)) + floor
     target = 10.0 ** (target_db / 20.0)
     gain = target / rms
-    gain = float(np.clip(gain, 0.25, 8.0))  # conservative clamp
+    gain = float(np.clip(gain, 0.25, 8.0))
     return (x * gain).astype(np.float32, copy=False)
 
 def energy_rms(x: np.ndarray) -> float:
@@ -103,10 +115,7 @@ def db(x: float) -> float:
 def capture_loop():
     """
     Capture loopback (system) + mic.
-    Build overlapped windows for each stream *after* simple cross-talk gating:
-      - If ME >> SYS by GATE_RATIO_DB, zero the system chunk for that frame slice.
-      - If SYS >> ME by GATE_RATIO_DB, zero the mic chunk for that frame slice.
-    This keeps each stream cleaner before transcription.
+    Build overlapped windows for each stream after simple cross-talk gating.
     """
     sys_mic = sc.get_microphone(id=speaker.name, include_loopback=True)
 
@@ -132,12 +141,9 @@ def capture_loop():
             d_sys = db(e_sys)
 
             if d_me - d_sys >= GATE_RATIO_DB:
-                # Your voice dominates => gate system slice
                 sys_mono[:] = 0.0
             elif d_sys - d_me >= GATE_RATIO_DB:
-                # System dominates => gate mic slice
                 me_mono[:] = 0.0
-            # else: similar energies -> keep both (e.g., duet/overlap)
 
             # Accumulate into per-stream buffers
             buf_me  = np.concatenate([buf_me,  me_mono]).astype(np.float32, copy=False)
@@ -166,7 +172,6 @@ def make_cloud_transcriber():
         def transcribe(audio_block_16k: np.ndarray) -> str:
             wav_bytes = wav_bytes_from_mono16k(audio_block_16k)
             kwargs = {"file": ("chunk.wav", wav_bytes), "model": OPENAI_MODEL}
-            # If using whisper-1, nudge decoding toward safer outputs
             if OPENAI_MODEL == "whisper-1":
                 kwargs.update({
                     "temperature": 0.0,
@@ -191,9 +196,9 @@ def make_local_transcriber():
                 language="en",
                 vad_filter=True,
                 condition_on_previous_text=False,
-                beam_size=5,                 # stronger search reduces random inserts
-                temperature=0.0,             # deterministic decoding curbs hallucinations
-                no_speech_threshold=0.8,     # more conservative on near-silence
+                beam_size=5,
+                temperature=0.0,
+                no_speech_threshold=0.8,
                 compression_ratio_threshold=2.4,
                 log_prob_threshold=-1.0,
             )
@@ -217,7 +222,6 @@ def transcribe_worker(tag: str, q: queue.Queue, hop_seconds: float, outfile: str
             except queue.Empty:
                 continue
             try:
-                # Light speech-focused conditioning before STT
                 proc = pre_emphasis(audio)
                 proc = normalize_rms(proc, target_db=-20.0)
                 text = transcribe_fn(proc)
@@ -230,7 +234,10 @@ def transcribe_worker(tag: str, q: queue.Queue, hop_seconds: float, outfile: str
                 stamp = time.strftime("%H:%M:%S", time.gmtime(t_accum))
                 line = f"[{stamp}] {tag} {text}"
                 print(line, flush=True)
-                f.write(line + "\n"); f.flush()
+                # serialize writes across workers to avoid interleaving
+                with file_lock:
+                    f.write(line + "\n")
+                    f.flush()
 
 _transcribe_thread = None
 
@@ -239,13 +246,18 @@ def start_transcription():
     if _transcribe_thread and _transcribe_thread.is_alive():
         print("Transcription already running")
         return
-    stop_flag.clear() 
+    stop_flag.clear()  # allow loops to run
     _transcribe_thread = threading.Thread(target=main, daemon=True)
     _transcribe_thread.start()
     print("Transcription started")
 
 def stop_transcription():
+    global _transcribe_thread
     stop_flag.set()
+    th = _transcribe_thread
+    if th and th.is_alive():
+        th.join(timeout=5.0)  # wait for clean shutdown
+    _transcribe_thread = None
     print("Stop signal sent")
 
 def main():
@@ -261,11 +273,12 @@ def main():
         using_cloud = True
     if transcribe_fn is None:
         print("No transcription backend available. Install faster-whisper (if supported) or set OPENAI_API_KEY.")
-        sys.exit(1)
+        return  # don't kill Streamlit with sys.exit
+
     if using_cloud:
         print(f"using cloud STT: {OPENAI_MODEL}")
 
-    print("starting capture + dual transcription… press Ctrl+C to stop.")
+    print("starting capture + dual transcription…")
     cap = threading.Thread(target=capture_loop, daemon=True)
 
     out_path = next_transcript_path()
