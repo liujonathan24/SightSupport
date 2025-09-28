@@ -17,6 +17,13 @@ pip install -r requirements.txt
 
 
 Required for MLLM inference:
+Download LM Studio
+
+lms get qwen2.5-vl-7b-instruct
+- select lmstudio-community/Qwen2.5-VL-7B-Instruct-GGUF
+- select Q3_k_L model (5.44 GB).
+lms load qwen2.5-vl-7b-instruct
+
 
 (SightSupport) PS C:\Users\QCWorkshop13\Documents\GitHub\SightSupport> lms status
 Server: ON (port: 1234)
