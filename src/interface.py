@@ -1,70 +1,107 @@
-# interface.py
-
+import subprocess
+import os
+import glob
 import streamlit as st
-
-# Run with: streamlit run src/interface.py
 
 # --- Page Config ---
 st.set_page_config(
-    page_title="AI Console",
-    page_icon="🤖",
+    page_title="Transcript History",
+    page_icon="💬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- Session State Setup ---
-if "conversations" not in st.session_state:
-    st.session_state.conversations = {"Session 1": []}
-if "current_session" not in st.session_state:
-    st.session_state.current_session = "Session 1"
+# --- State Setup ---
+if "processes" not in st.session_state:
+    st.session_state.processes = []
 
-# --- Sidebar ---
-st.sidebar.title("⚙️ Configurations")
+# --- Transcript folder ---
+TRANSCRIPTS_FOLDER = "/src/transcripts"  # PUT FULL PATH TO TRANSCRIPTS FOLDER HERE
+os.makedirs(TRANSCRIPTS_FOLDER, exist_ok=True)
 
-# Model settings (example fields)
-model = st.sidebar.selectbox("Model", ["GPT-4", "GPT-3.5", "Custom"])
-temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.7)
-
-# History Tabs
-st.sidebar.markdown("---")
-st.sidebar.subheader("💬 History")
-
-# Select current session
-session_choice = st.sidebar.radio(
-    "Choose a session:",
-    list(st.session_state.conversations.keys()),
-    index=list(st.session_state.conversations.keys()).index(st.session_state.current_session),
+# --- Load all transcript files ---
+files = sorted(
+    glob.glob(os.path.join(TRANSCRIPTS_FOLDER, "*.txt")),
+    key=os.path.getmtime,
+    reverse=True
 )
 
-if session_choice != st.session_state.current_session:
-    st.session_state.current_session = session_choice
+transcripts = {}
+for f in files:
+    name = os.path.basename(f)
+    with open(f, "r") as file:
+        transcripts[name] = file.read()
 
-# Add new session
-if st.sidebar.button("➕ New Session"):
-    new_name = f"Session {len(st.session_state.conversations) + 1}"
-    st.session_state.conversations[new_name] = []
-    st.session_state.current_session = new_name
+# --- Ensure at least one transcript ---
+if not transcripts:
+    default_name = "Transcript_1.txt"
+    transcripts[default_name] = ""
+    file_path = os.path.join(TRANSCRIPTS_FOLDER, default_name)
+    with open(file_path, "w") as f:
+        f.write("")
+
+# --- CSS for big buttons ---
+st.markdown("""
+<style>
+div.stButton > button {
+    font-size: 22px;
+    padding: 15px 50px;
+    margin: 10px 10px 10px 0;
+    border-radius: 12px;
+}
+.run-btn {
+    background-color: #4CAF50;
+    color: white;
+}
+.run-btn:hover {
+    background-color: #45a049;
+}
+.stop-btn {
+    background-color: #f44336;
+    color: white;
+}
+.stop-btn:hover {
+    background-color: #da190b;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.subheader("Run the HUD")  # <-- New title above buttons
+
+# --- Top Buttons ---
+col1, col2 = st.columns([1, 1])
+with col1:
+    if st.button("▶️ Run Scripts", key="run"):
+        script_path = os.path.abspath("/src/hud/HUD.py") # PUT FULL PATH TO HUD.PY HERE
+        script1 = subprocess.Popen(["python", script_path])
+        st.session_state.processes.append(script1)
+        st.success("HUD.py started!")
+
+with col2:
+    if st.button("⏹ Stop Scripts", key="stop"):
+        for p in st.session_state.processes:
+            p.terminate()
+        st.session_state.processes.clear()
+        st.warning("HUD.py stopped.")
+
+# --- Sidebar ---
+st.sidebar.title("💬 History")
+current_transcript = st.sidebar.radio(
+    "Choose a transcript:",
+    list(transcripts.keys()),
+    index=0
+)
 
 # --- Main Console ---
-st.title("🖥️ AI Console")
+st.title("💬 Transcript Console")
+st.subheader(f"Viewing: {current_transcript}")
 
-# Display conversation history
-for role, message in st.session_state.conversations[st.session_state.current_session]:
-    with st.chat_message(role):
-        st.markdown(message)
-
-# Input box
-if query := st.chat_input("Type your query here..."):
-    # Append user query
-    st.session_state.conversations[st.session_state.current_session].append(("user", query))
-
-    # --- Placeholder for AI response logic ---
-    # In production, call your LLM API here
-    response = f"(Simulated {model} response at temp={temperature}): {query[::-1]}"
-
-    # Append response
-    st.session_state.conversations[st.session_state.current_session].append(("assistant", response))
-
-    # Display immediately
-    with st.chat_message("assistant"):
-        st.markdown(response)
+# Display transcript in a scrollable text area (bounded box)
+st.text_area(
+    "Transcript Content",
+    value=transcripts[current_transcript],
+    height=400,
+    max_chars=None,
+    key=current_transcript,
+    disabled=True
+)
