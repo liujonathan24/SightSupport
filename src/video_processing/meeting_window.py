@@ -9,7 +9,7 @@ from src.helpers import logging_utils
 logging_utils.setup_logging(name="zoom_app", level=10)  # DEBUG
 log = logging_utils.get_logger("zoom_app")
 
-@logging_utils.trace_calls(logger=log)
+# @logging_utils.trace_calls(logger=log)
 def find_window_title_contains(substring: str) -> int | None:
     substring_lower = substring.lower()
     result = {"hwnd": None}
@@ -23,27 +23,27 @@ def find_window_title_contains(substring: str) -> int | None:
                 result["hwnd"] = hwnd
 
     win32gui.EnumWindows(enum_handler, None)
-    if result["hwnd"] is None:
-        log.debug("No window title matched substring=%r", substring)
-    else:
-        log.debug("Matched hwnd=%s title=%r", result["hwnd"], win32gui.GetWindowText(result["hwnd"]))
+    # if result["hwnd"] is None:
+        # log.debug("No window title matched substring=%r", substring)
+    # else:
+        # log.debug("Matched hwnd=%s title=%r", result["hwnd"], win32gui.GetWindowText(result["hwnd"]))
     return result["hwnd"]
 
-@logging_utils.trace_class(logger=log)
+# @logging_utils.trace_class(logger=log)
 class Window:
-    def __init__(self, args):
+    def __init__(self, app):
         window_name = {
             "Zoom": "Zoom Meeting",
             "Google Meet": "Google Meet",
         }
 
         # Gets the meeting title of the desired app, defaults to Zoom otherwise.
-        target_title = window_name.get(args.app, "Zoom Meeting")
+        target_title = window_name.get(app, "Zoom Meeting")
         
 
         self.hwnd = find_window_title_contains(target_title)
         if not self.hwnd:
-            log.warning("No window found containing %r", target_title)
+            # log.warning("No window found containing %r", target_title)
             self.image = None
             # Ensure handles are defined for safe cleanup
             self.hwndDC = None
@@ -61,8 +61,8 @@ class Window:
         rect = win32gui.GetWindowRect(self.hwnd)
         width = rect[2] - rect[0]
         height = rect[3] - rect[1]
-        log.info("Found HWND=%s title=%r size=%dx%d", self.hwnd, title, width, height)
-        log.debug("Client area scaled size=%dx%d", screen_width, screen_height)
+        # log.info("Found HWND=%s title=%r size=%dx%d", self.hwnd, title, width, height)
+        # log.debug("Client area scaled size=%dx%d", screen_width, screen_height)
 
         # Create DCs and reusable bitmap buffer
         self.hwndDC = win32gui.GetWindowDC(self.hwnd)
@@ -80,11 +80,11 @@ class Window:
     def get_image(self):
         # Render latest frame into the offscreen bitmap
         result = windll.user32.PrintWindow(self.hwnd, self.saveDC.GetSafeHdc(), 3)
-        log.debug("PrintWindow result=%s", result)
+        # log.debug("PrintWindow result=%s", result)
 
         bmpinfo = self.saveBitMap.GetInfo()
         bmpstr = self.saveBitMap.GetBitmapBits(True)
-        log.debug("Bitmap info: %s", bmpinfo)
+        # log.debug("Bitmap info: %s", bmpinfo)
 
         im = Image.frombuffer(
             "RGB",
@@ -126,10 +126,10 @@ class Window:
                 win32gui.ReleaseDC(self.hwnd, self.hwndDC)
         except Exception:
             pass
-        log.debug("Released GDI resources")
+        # log.debug("Released GDI resources")
 
-def main(args):
-    meeting = Window(args)
+def main(app):
+    meeting = Window(app)
     i = 0
     while True:
         i += 1
@@ -145,4 +145,4 @@ if __name__ == "__main__":
     parser.add_argument("--app", "-a", default="Zoom", help="Meeting application")
     args = parser.parse_args() 
 
-    main(args)
+    main(args.app)
