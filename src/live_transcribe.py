@@ -11,21 +11,6 @@ import numpy as np
 import soundcard as sc
 import soundfile as sf
 
-_transcribe_thread = None
-
-def start_transcription():
-    global _transcribe_thread
-    if _transcribe_thread and _transcribe_thread.is_alive():
-        print("Transcription already running")
-        return
-    _transcribe_thread = threading.Thread(target=main, daemon=True)
-    _transcribe_thread.start()
-    print("Transcription started")
-
-def stop_transcription():
-    stop_flag.set()
-    print("Stop signal sent")
-
 # Cloud STT
 try:
     from openai import OpenAI
@@ -247,6 +232,22 @@ def transcribe_worker(tag: str, q: queue.Queue, hop_seconds: float, outfile: str
                 print(line, flush=True)
                 f.write(line + "\n"); f.flush()
 
+_transcribe_thread = None
+
+def start_transcription():
+    global _transcribe_thread
+    if _transcribe_thread and _transcribe_thread.is_alive():
+        print("Transcription already running")
+        return
+    stop_flag.clear() 
+    _transcribe_thread = threading.Thread(target=main, daemon=True)
+    _transcribe_thread.start()
+    print("Transcription started")
+
+def stop_transcription():
+    stop_flag.set()
+    print("Stop signal sent")
+
 def main():
     print("default speaker:", speaker.name)
     print("default microphone:", microph.name)
@@ -280,7 +281,7 @@ def main():
 
     cap.start(); me_worker.start(); sys_worker.start()
     try:
-        while True:
+        while not stop_flag.is_set():
             time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nstopping…")
