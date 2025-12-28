@@ -23,7 +23,7 @@ To solve this problem, we built an intelligent gesture recognition system that d
 - Overlapped 6-second windows with 3-second hop for low-latency analysis
 
 ### Visual Analysis
-- Multimodal VLM (Qwen2.5-VL-7B-Instruct) running on LM Studio
+- Multimodal VLM (Qwen2.5-VL-7B-Instruct) running on LM Studio (4 bit quantized).
 - Continuous frame capture at 0.5s intervals from Zoom/Google Meet
 - 4x4 grid storyboard generation for gesture analysis
 - Real-time sentiment classification (positive/negative expressions)
