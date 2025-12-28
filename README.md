@@ -4,7 +4,12 @@ Individuals who are blind or low vision face major struggles in digital communic
 
 In fact, studies show that a significant portion of conversations are actually conveyed through nonverbal body language such as facial expressions and gestures, such as head shaking or nodding. Especially when online work reduces social interaction between employees, which limits the chance to ask about coworkers’ reactions, an automated detection measure would provide blind people the awareness that they deserve. 
 
-We plan to build an intelligent gesture recognition system that can detect and interpret body language and visual cues on digital communication sites, such as Zoom meetings or phone calls. Furthermore, we will add an integrated assistant that a user can query, making it possible for someone to learn about key team members’ reactions to their ideas, or summarize the tacit sentiment regarding a specific idea. Cues and relevant information will then be relayed to visually impaired people in real-time through haptic feedback and audio prompts, helping them to participate fully in online communication. 
+To solve this problem, we built an intelligent gesture recognition system that detects and interprets body language and visual cues on digital communication sites, such as Zoom meetings or Google meet. Furthermore, we integrated an assistant that a user can query, making it possible for someone to learn about key team members’ reactions to their ideas, or summarize the tacit sentiment regarding a specific idea. Cues and relevant information will then be relayed to visually impaired people in real-time through haptic feedback and audio prompts, helping them to participate fully in online communication. 
+
+# Features:
+- Audio transcription using faster-whisper
+- Visual cues extraction using Qwen VLM
+- User assistant for analyzing meeting information online and offline
 
 
 # Setup:
