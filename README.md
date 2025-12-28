@@ -6,10 +6,48 @@ In fact, studies show that a significant portion of conversations are actually c
 
 To solve this problem, we built an intelligent gesture recognition system that detects and interprets body language and visual cues on digital communication sites, such as Zoom meetings or Google meet. Furthermore, we integrated an assistant that a user can query, making it possible for someone to learn about key team members’ reactions to their ideas, or summarize the tacit sentiment regarding a specific idea. Cues and relevant information will then be relayed to visually impaired people in real-time through haptic feedback and audio prompts, helping them to participate fully in online communication. 
 
-# Features:
-- Audio transcription using faster-whisper
-- Visual cues extraction using Qwen VLM
-- User assistant for analyzing meeting information online and offline
+# Features
+
+## Key Highlights
+- **Real-time body language detection** using multimodal AI (Qwen2.5-VL)
+- **Haptic feedback** for sentiment-aware notifications on mobile
+- **Dual-stream audio transcription** with cross-talk detection
+- **RAG-powered assistant** for querying meeting context
+
+## Core Capabilities
+
+### Audio Processing
+- Dual-stream transcription separating microphone [ME] and system audio [SYS]
+- Local transcription via faster-whisper or cloud fallback via OpenAI Whisper API
+- Advanced DSP: pre-emphasis filtering (0.97), RMS normalization (-20dB target)
+- Overlapped 6-second windows with 3-second hop for low-latency analysis
+
+### Visual Analysis
+- Multimodal VLM (Qwen2.5-VL-7B-Instruct) running on LM Studio
+- Continuous frame capture at 0.5s intervals from Zoom/Google Meet
+- 4x4 grid storyboard generation for gesture analysis
+- Real-time sentiment classification (positive/negative expressions)
+
+### Meeting Assistant (RAG)
+- Context-aware Q&A using meeting transcripts as knowledge base
+- Streaming responses for real-time token-by-token feedback
+
+### User Interfaces
+- **Web Dashboard (Streamlit)**: Live transcript viewer, process control, assistant chat
+- **Desktop HUD (PyQt5)**: Always-on-top frameless display with translucent background
+- Animated settings panel with toggleable features
+- Dark/light theme support with high-contrast accessibility
+
+### Accessibility
+- Haptic feedback via Pushbullet API (single pulse = positive, double = negative)
+- System-level hotkeys: Alt+D (data collect), Alt+X (reset), Alt+Z (settings)
+- Audio-first design for screen reader compatibility
+- Keyboard-only navigation support
+
+### Platform Integration
+- Native window capture for Zoom and Google Meet via Windows API
+- Windows Media Foundation for audio device enumeration
+- Multi-threaded architecture with synchronized file I/O
 
 
 # Setup:
